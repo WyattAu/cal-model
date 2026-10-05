@@ -1,0 +1,278 @@
+/* ASAP2 description — powertrain.a2l
+ * Generator: EstateCal 4.2   ASAP2 version 1.61
+ * Two-ECU powertrain calibration: engine + transmission.
+ *
+ * The COMPU_METHODs span every conversion type this crate evaluates:
+ * LINEAR, RAT_FUNC (both the reducible-linear and the genuinely
+ * quadratic form), TABLE (TAB_INTP interpolation and TAB_VERB step
+ * lookup), and IDENTITY.
+ */
+
+ASAP2_VERSION 1 61
+VERSION "powertrain 1.0.0"
+PROJECT_NO pt_42
+
+/begin PROJECT powertrain "Two-ECU powertrain — engine + transmission"
+
+  /begin HEADER "Project header"
+    VERSION "1.0.0"
+    PROJECT_NO pt_42
+  /end HEADER
+
+  /begin MODULE engine "V8 engine ECU"
+
+    /begin IF_DATA DCM
+      {
+        DCM { static { items { item { name "eng_load"; } } } }
+      }
+    /end IF_DATA
+
+    /begin RECORD_LAYOUT RL_UWORD
+      FNC_VALUES 1 UWORD COLUMN_DIR DIRECT
+    /end RECORD_LAYOUT
+
+    /begin RECORD_LAYOUT RL_UBYTE
+      FNC_VALUES 1 UBYTE COLUMN_DIR DIRECT
+    /end RECORD_LAYOUT
+
+    /begin RECORD_LAYOUT RL_UWORD_BLOCK
+      FNC_VALUES 1 UWORD COLUMN_DIR DIRECT
+      NO_AXIS_PTS_X 1
+      NO_AXIS_PTS_Y 1
+    /end RECORD_LAYOUT
+
+    /begin COMPU_METHOD rpm_lin "Engine speed, 0.25 rpm per count" LINEAR
+      "%.2f" "1/min" COEFFS_LINEAR 0.25 0
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD load_lin "Relative load, 0.1 % per count, -10 % offset" LINEAR
+      "%.2f" "%" COEFFS_LINEAR 0.1 -10
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD press_rat "Boost pressure, quadratic rational" RAT_FUNC
+      "%.3f" "kPa" COEFFS 0.0001 0.5 0 0 0 1
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD torque_lin "Torque, reducible rational (0.5x + 100) / 2" RAT_FUNC
+      "%.2f" "Nm" COEFFS 0 0.5 100 0 0 2
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD boost_tab "Boost target lookup (interpolated)" TABLE
+      "%.2f" "kPa" COMPU_TAB_REF boost_curve_tab
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD gear_conv "Gear index lookup (stepped)" TABLE
+      "%.0f" "-" COMPU_TAB_REF gear_vtab
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD identity_raw "Raw passthrough" IDENTICAL
+      "%.0f" "-"
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD flag_ident "Boolean flag passthrough" IDENTICAL
+      "%.0f" "-"
+    /end COMPU_METHOD
+
+    /begin COMPU_TAB boost_curve_tab "Boost target over engine speed" TAB_INTP
+      DEFAULT_VALUE_NUMERIC 0 0
+      0 0
+      1000 45
+      2000 78
+      3000 105
+      4000 128
+      5000 142
+      6000 150
+    /end COMPU_TAB
+
+    /begin COMPU_VTAB gear_vtab "Gear index" TAB_VERB
+      DEFAULT_VALUE_NUMERIC 0 0
+      0 0
+      1 1
+      2 2
+      3 3
+      4 4
+    /end COMPU_VTAB
+
+    /begin CHARACTERISTIC eng_load "Engine load request" VALUE 0x720100
+      RL_UWORD 0 load_lin 0.0 100.0
+      FORMAT "%.2f"
+      ECU_ADDRESS 0x720100
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC eng_torque_max "Maximum engine torque" VALUE 0x720102
+      RL_UWORD 0 torque_lin 50.0 700.0
+      ECU_ADDRESS 0x720102
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC idle_target_rpm "Idle target speed" VALUE 0x720104
+      RL_UWORD 10 rpm_lin 500.0 1200.0
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC boost_target "Boost pressure target" VALUE 0x720106
+      RL_UWORD 0 press_rat 0.0 250.0
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC rev_limit_cut "Rev limiter cut enabled" VALUE 0x720108
+      RL_UBYTE 5 flag_ident 0.0 1.0
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC ecu_serial "ECU identification string" ASCII 0x700100
+      RL_UBYTE 0 identity_raw 0.0 0.0
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC boost_curve "Boost target curve over speed" CURVE 0x721000
+      RL_UWORD_BLOCK 0 boost_tab 0.0 250.0
+      DISPLAY_IDENTIFIER BoostTarget
+      /begin AXIS_DESCR rpm_axis "Engine speed" UWORD 0x729000
+        NO_AXIS_PTS 8
+        INPUT_QUANTITY engine_speed
+      /end AXIS_DESCR
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC inj_map "Main injection quantity" MAP 0x722000
+      RL_UWORD_BLOCK 0 load_lin 0.0 100.0
+      EXTENDED_LIMITS 0.0 120.0
+      /begin AXIS_DESCR load_axis "Relative load" UWORD 0x729800
+        NO_AXIS_PTS 16
+        INPUT_QUANTITY eng_load
+      /end AXIS_DESCR
+      /begin AXIS_DESCR rpm_axis "Engine speed" UWORD 0x729C00
+        NO_AXIS_PTS 16
+        INPUT_QUANTITY engine_speed
+      /end AXIS_DESCR
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC knock_table "Knock threshold value block" VAL_BLK 0x723000
+      RL_UWORD_BLOCK 0 boost_tab 0.0 250.0
+    /end CHARACTERISTIC
+
+    /begin MEASUREMENT engine_speed "Engine speed" UWORD
+      rpm_lin 0.01 0.0 0.0 8000.0
+      ECU_ADDRESS 0x320001
+      FORMAT "%.0f"
+    /end MEASUREMENT
+
+    /begin MEASUREMENT coolant_temp "Coolant temperature" SBYTE
+      load_lin 1.0 0.0 -40.0 120.0
+      ECU_ADDRESS 0x320100
+    /end MEASUREMENT
+
+    /begin MEASUREMENT boost_actual "Measured boost pressure" UWORD
+      press_rat 0.01 0.0 0.0 250.0
+      ECU_ADDRESS 0x320200
+    /end MEASUREMENT
+
+    /begin FUNCTION torque_chain "Torque model outputs"
+      DEF_CHARACTERISTIC eng_torque_max
+      IN_MEASUREMENT engine_speed
+      LOC_MEASUREMENT boost_actual
+    /end FUNCTION
+
+    /begin GROUP calibration_group "Engine adjustables"
+      GROUP_CHARACTERISTIC eng_load eng_torque_max boost_target
+    /end GROUP
+
+  /end MODULE
+
+  /begin MODULE transmission "Transmission ECU"
+
+    /begin RECORD_LAYOUT RL_UWORD
+      FNC_VALUES 1 UWORD COLUMN_DIR DIRECT
+    /end RECORD_LAYOUT
+
+    /begin RECORD_LAYOUT RL_UBYTE
+      FNC_VALUES 1 UBYTE COLUMN_DIR DIRECT
+    /end RECORD_LAYOUT
+
+    /begin RECORD_LAYOUT RL_UWORD_BLOCK
+      FNC_VALUES 1 UWORD COLUMN_DIR DIRECT
+    /end RECORD_LAYOUT
+
+    /begin COMPU_METHOD ratio_lin "Gear ratio, 1e-4 per count" LINEAR
+      "%.5f" "-" COEFFS_LINEAR 0.0001 0
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD shift_time_lin "Shift time, 0.5 ms per count, -20 ms offset" LINEAR
+      "%.2f" "ms" COEFFS_LINEAR 0.5 -20
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD clutch_rat "Clutch force, quadratic rational" RAT_FUNC
+      "%.3f" "N" COEFFS 0.0005 0.2 0 0 0 1
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD trq_lin "Line pressure, reducible rational x / 4" RAT_FUNC
+      "%.2f" "kPa" COEFFS 0 1 0 0 0 4
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD gear_tab "Gear position lookup (interpolated)" TABLE
+      "%.0f" "-" COMPU_TAB_REF gear_pos_tab
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD ratio_tab "Ratio index lookup (stepped)" TABLE
+      "%.0f" "-" COMPU_TAB_REF ratio_vtab
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD raw_ident "Raw counter passthrough" IDENTICAL
+      "%.0f" "-"
+    /end COMPU_METHOD
+
+    /begin COMPU_METHOD count_ident "Mode counter passthrough" IDENTICAL
+      "%.0f" "-"
+    /end COMPU_METHOD
+
+    /begin COMPU_TAB gear_pos_tab "Gear position over input speed" TAB_INTP
+      DEFAULT_VALUE_NUMERIC 0 0
+      0 0
+      10 1
+      25 2
+      45 3
+    /end COMPU_TAB
+
+    /begin COMPU_VTAB ratio_vtab "Ratio index" TAB_VERB
+      DEFAULT_VALUE_NUMERIC 1 0
+      1 0
+      2 1
+      3 2
+      4 3
+    /end COMPU_VTAB
+
+    /begin CHARACTERISTIC primary_ratio "Primary gear ratio" VALUE 0x730100
+      RL_UWORD 0 ratio_lin 0.0 3.5
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC shift_pressure "Line shift pressure" VALUE 0x730102
+      RL_UWORD 0 trq_lin 0.0 100.0
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC shift_time_ms "Shift duration" VALUE 0x730104
+      RL_UWORD 5 shift_time_lin -20.0 250.0
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC clutch_force "Clutch apply force" VALUE 0x730106
+      RL_UWORD 0 clutch_rat 0.0 200.0
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC gear_code "Selected gear code" VALUE 0x730108
+      RL_UBYTE 0 gear_tab 0.0 6.0
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC shift_map "Shift-time map over load and speed" MAP 0x732000
+      RL_UWORD_BLOCK 0 shift_time_lin -20.0 250.0
+      /begin AXIS_DESCR load_axis "Relative load" UWORD 0x739800
+        NO_AXIS_PTS 8
+      /end AXIS_DESCR
+    /end CHARACTERISTIC
+
+    /begin MEASUREMENT turb_speed "Turbine speed" UWORD
+      ratio_lin 0.01 0.0 0.0 3.5
+      ECU_ADDRESS 0x330001
+    /end MEASUREMENT
+
+    /begin MEASUREMENT out_speed "Output shaft speed" UWORD
+      raw_ident 0.1 0.0 0.0 6553.5
+      ECU_ADDRESS 0x330100
+    /end MEASUREMENT
+
+  /end MODULE
+
+/end PROJECT

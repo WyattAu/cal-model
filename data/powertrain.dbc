@@ -1,0 +1,17 @@
+VERSION "powertrain 1.0.0"
+
+
+BO_ 192 ECM_Status: 8 ECM
+ SG_ eng_load : 0|12@1+ (0.1,-10) [0|100] "%" ECM,TCU
+ SG_ engine_speed : 16|16@1+ (0.25,0) [0|16383.75] "1/min" ECM,TCU
+ SG_ coolant_temp : 32|8@1+ (1,-40) [-40|87] "degC" ECM
+ SG_ boost_target : 39|12@0+ (0.5,0) [0|1023.5] "kPa" ECM
+ SG_ boost_actual : 51|12@0+ (0.025,0) [0|102.375] "kPa" ECM
+
+BO_ 320 TCU_Status: 8 TCU
+ SG_ shift_pressure : 0|10@1+ (0.25,0) [0|255.75] "kPa" TCU,ECM
+ SG_ out_speed : 8|16@1+ (0.1,0) [0|6553.5] "1/min" TCU
+ SG_ primary_ratio : 24|12@1+ (0.0001,0) [0|0.4095] "-" TCU
+ SG_ gear_code : 40|4@1+ (1,0) [0|15] "-" TCU
+
+VAL_ 192 eng_load 0 "closed" 50 "part" 100 "wide" ;

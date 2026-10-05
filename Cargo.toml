@@ -1,0 +1,58 @@
+[package]
+name = "cal-model"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Wyatt Au <wyatt_au@protonmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/WyattAu/cal-model"
+homepage = "https://github.com/WyattAu/cal-model"
+documentation = "https://docs.rs/cal-model"
+description = "A2L calibration data model and session layer — characteristic binding, COMPU_METHOD conversions, limit validation, curve calibration"
+readme = "README.md"
+keywords = ["a2l", "calibration", "automotive", "xcp", "ecu"]
+categories = ["science", "data-structures", "encoding", "parser-implementations"]
+exclude = [".github/", "fuzz/", "supply-chain/"]
+
+# Layer model: docs/layers.md in WyattAu/engineering-standards.
+# L2 — domain: the application half of the automotive calibration stack.
+# Its only estate-internal edges point down the stack (a2l-parse L1,
+# xcp-core L1, dbc-parse L0), so the effective layer is exactly L2.
+# See docs/layers.md §Rules rule 1.
+[package.metadata.layers]
+tier = "L2"
+
+# L1 substrates for the description and transport halves of the calibration
+# stack; dbc-parse L0 supplies the CAN signal layout that binds a
+# CHARACTERISTIC to a message signal. thiserror carries the typed error
+# taxonomy (xcp-core's own precedent) — no other runtime dependency.
+[dependencies]
+a2l-parse = "0.1"
+dbc-parse = "0.1"
+xcp-core = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+
+# Tier A discipline: a calibration session drives real ECU memory, and an
+# A2L description is untrusted supplier input. Conversions, limit checks,
+# and snapshot/diff must be total: bounds are checked at every access, every
+# failure is a typed error, and no input can panic. The lib target holds
+# these lints; test, example, and fuzz targets lift them at the file level
+# with justification (assertions need them by design).
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

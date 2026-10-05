@@ -13,8 +13,7 @@
 )]
 
 use cal_model::{
-    CalError, CalibrationProject, CharKind, Measurement, SignalBinding, ByteOrder,
-    SAMPLE_A2L,
+    ByteOrder, CalError, CalibrationProject, CharKind, Measurement, SignalBinding, SAMPLE_A2L,
 };
 
 /// A one-characteristic description over `datatype`, so every datatype in the
@@ -48,17 +47,31 @@ fn every_integer_datatype_yields_its_width_bounds() {
         ("ULONG", 4, 32, 0.0, 4294967295.0),
         ("SLONG", 4, 32, -2147483648.0, 2147483647.0),
         ("A_UINT64", 8, 64, 0.0, 18446744073709551615.0),
-        ("A_INT64", 8, 64, -9223372036854775808.0, 9223372036854775807.0),
+        (
+            "A_INT64",
+            8,
+            64,
+            -9223372036854775808.0,
+            9223372036854775807.0,
+        ),
     ];
 
     for (datatype, bytes, bits, lower, upper) in cases {
         let (project, _) = project_with_datatype(datatype);
         let characteristic = project.characteristic("m", "value").unwrap();
         assert_eq!(characteristic.element_bits(), bits, "{datatype} bits");
-        assert_eq!(characteristic.datatype.size_bytes(), bytes, "{datatype} size");
+        assert_eq!(
+            characteristic.datatype.size_bytes(),
+            bytes,
+            "{datatype} size"
+        );
         // The element count defaults to 1 until declared.
         assert_eq!(characteristic.size_bytes(), bytes, "{datatype} deposit");
-        assert_eq!(characteristic.value_bounds(), (lower, upper), "{datatype} bounds");
+        assert_eq!(
+            characteristic.value_bounds(),
+            (lower, upper),
+            "{datatype} bounds"
+        );
         assert_eq!(
             characteristic.is_signed(),
             datatype.starts_with('S') || datatype == "A_INT64",
@@ -290,7 +303,11 @@ fn the_sample_project_is_internally_coherent() {
     // declared deposit, and a datatype with a real width.
     for module in project.modules() {
         for characteristic in &module.characteristics {
-            assert!(!characteristic.deposit.is_empty(), "{}", characteristic.name);
+            assert!(
+                !characteristic.deposit.is_empty(),
+                "{}",
+                characteristic.name
+            );
             assert!(
                 characteristic.datatype.size_bytes() > 0,
                 "{}",
@@ -298,9 +315,12 @@ fn the_sample_project_is_internally_coherent() {
             );
             assert!(characteristic.element_bits() > 0);
             // The declared element count fits one XCP UPLOAD.
-            let span =
-                usize::from(characteristic.deposit_position) + characteristic.size_bytes();
-            assert!(span <= usize::from(u8::MAX), "{}: {span}", characteristic.name);
+            let span = usize::from(characteristic.deposit_position) + characteristic.size_bytes();
+            assert!(
+                span <= usize::from(u8::MAX),
+                "{}: {span}",
+                characteristic.name
+            );
             // And the conversion is resolvable, tables included.
             assert!(
                 project.resolved_conversion(characteristic).is_ok(),
@@ -333,7 +353,10 @@ fn the_sample_project_is_internally_coherent() {
                     (first.address, first.size_bytes()),
                     (second.address, second.size_bytes()),
                     "{}.{} and {}.{} overlap",
-                    module.name, first.name, module.name, second.name
+                    module.name,
+                    first.name,
+                    module.name,
+                    second.name
                 );
             }
         }

@@ -340,7 +340,8 @@ pub fn scan(text: &str) -> Result<TableSet, CalError> {
 
 /// Index of the token *after* the `/end` that closes `open` at `open_idx`.
 fn matching_end(tokens: &[Tok], open_idx: usize, open: &str) -> Result<Option<usize>, CalError> {
-    let mut depth = 0usize;
+    // `open_idx` is the block *name*, i.e. we are already one `/begin` deep.
+    let mut depth = 1usize;
     let mut i = open_idx;
     while i < tokens.len() {
         if let Tok::Slash(word) = &tokens[i] {

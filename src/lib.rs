@@ -72,7 +72,7 @@
 //!
 //! // 2. Look a parameter up and convert both ways.
 //! let module = project.module("engine")?;
-//! assert_eq!(module.characteristics.len(), 8);
+//! assert_eq!(module.characteristics.len(), 9);
 //! let idle = project.characteristic("engine", "idle_target_rpm")?;
 //! assert_eq!(idle.address, 0x720104);
 //! // 3200 counts * 0.25 rpm/count = 800 rpm.
@@ -84,10 +84,9 @@
 //! assert!(project.check_limits("engine", "idle_target_rpm", 0).is_err());
 //!
 //! // 4. Read-modify-write against a bench mock.
-//! let mut transport = MockTransport::new();
-//! transport.seed(&project, cal_model::sample::seed_pages())?;
 //! let mut session = cal_model::CalibrationSession::connect(
-//!     &project, Box::new(transport), ResourceMode::CONNECT_NORMAL,
+//!     &project, Box::new(cal_model::seeded_transport(&project)?),
+//!     ResourceMode::CONNECT_NORMAL,
 //! )?;
 //! let before = session.read_characteristic("engine", "idle_target_rpm")?;
 //! assert!((before - 800.0).abs() < 1e-9);
@@ -103,14 +102,31 @@
 // fleet pedantic policy.
 #![allow(clippy::doc_markdown)]
 
+mod calibrate;
 mod conversion;
 mod error;
+mod mock;
 mod model;
+mod project;
+mod sample;
+mod session;
+mod signal;
 mod tables;
 
+pub use calibrate::{
+    calibrate_curve, optimal_point, optimize_working_point, optimize_working_point_with_budget,
+    CalParameter, Curve,
+};
 pub use conversion::CompuMethod;
 pub use error::CalError;
+pub use mock::{MemoryPage, MockTransport};
 pub use model::{CharKind, Characteristic, Measurement, Module};
+pub use project::CalibrationProject;
+pub use sample::{seeded_transport, seed_values, SAMPLE_A2L, SAMPLE_DBC};
+pub use session::{
+    render_deltas, CalibrationDelta, CalibrationSession, Snapshot, SnapshotEntry, XcpTransport,
+};
+pub use signal::SignalBinding;
 pub use tables::{CompuTabKind, CompuTable};
 
 pub use dbc_parse::ByteOrder;

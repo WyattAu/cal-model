@@ -297,80 +297,71 @@ enum Tok {
 /// ASAP2 at all.
 pub fn scan(text: &str) -> Result<TableSet, CalError> {
     let tokens = tokenize(text)?;
-    let mut set = TableSet::default();
-    let mut i = 0usize;
-    while i < tokens.len() {
-        let Tok::Slash(word) = &tokens[i] else {
-            i += 1;
+    // A single forward pass with an explicit stack: every `/begin` is opened
+    // and every `/end` closes it, at any nesting depth. A `COMPU_TAB` is
+    // declared inside a MODULE inside a PROJECT, so a walk that skipped over
+    // a block's body would skip every table in the file.
+    let mut open: Vec<(usize, String)> = Vec::new();
+    let mut closed: Vec<(usize, String, usize)> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let Tok::Slash(word) = token else {
             continue;
         };
-        if word != "begin" {
-            i += 1;
-            continue;
+        if word == "begin" {
+            let Some(Tok::Word(name)) = tokens.get(index + 1) else {
+                return Err(CalError::MalformedA2l(
+                    "/begin must be followed by a block keyword".to_owned(),
+                ));
+            };
+            // The body starts after the keyword and the block's own name.
+            open.push((index + 2, name.clone()));
+        } else if word == "end" {
+            // A stray `/end` with nothing open is skipped rather than fatal:
+            // vendor banners close with one.
+            let Some((body_start, name)) = open.pop() else {
+                continue;
+            };
+            let Some(Tok::Word(closed_name)) = tokens.get(index + 1) else {
+                return Err(CalError::MalformedA2l(format!(
+                    "/end must be followed by a block keyword, closing {name}"
+                )));
+            };
+            if *closed_name != name {
+                return Err(CalError::MismatchedA2lBlock {
+                    opened: name,
+                    closed: closed_name.clone(),
+                });
+            }
+            closed.push((body_start, name, index));
         }
-        let Some(Tok::Word(block)) = tokens.get(i + 1) else {
-            return Err(CalError::MalformedA2l(
-                "/begin must be followed by a block keyword".to_owned(),
-            ));
-        };
-        let block = block.clone();
-        // Locate the matching `/end`, tracking nesting so a vendor block
-        // containing a nested one cannot truncate our slice.
-        let body_start = i + 2;
-        let Some(body_end) = matching_end(&tokens, i + 1, &block)? else {
-            return Err(CalError::UnterminatedA2lBlock(block));
-        };
-        match block.as_str() {
+    }
+    if let Some((_, name)) = open.pop() {
+        return Err(CalError::UnterminatedA2lBlock(name));
+    }
+
+    // Process in file order (by block start), not close order, so a later
+    // declaration overrides an earlier one deterministically.
+    closed.sort_by_key(|(body_start, _, _)| *body_start);
+    let mut set = TableSet::default();
+    for (body_start, name, body_end) in closed {
+        let body = tokens.get(body_start..body_end).unwrap_or_default();
+        match name.as_str() {
             "COMPU_TAB" | "COMPU_VTAB" => {
-                if let Some(table) = parse_table(&block, &tokens[body_start..body_end])? {
+                if let Some(table) = parse_table(&name, body)? {
                     set.insert(table);
                 }
             }
             "CHARACTERISTIC" => {
-                if let Some((name, points)) = parse_axis_points(&tokens[body_start..body_end]) {
-                    set.set_axis_points(name, points);
+                if let Some((characteristic, points)) = parse_axis_points(body) {
+                    set.set_axis_points(characteristic, points);
                 }
             }
             _ => {}
         }
-        i = body_end + 2; // skip past `/end BLOCK`
     }
     Ok(set)
 }
 
-/// Index of the token *after* the `/end` that closes `open` at `open_idx`.
-fn matching_end(tokens: &[Tok], open_idx: usize, open: &str) -> Result<Option<usize>, CalError> {
-    // `open_idx` is the block *name*, i.e. we are already one `/begin` deep.
-    let mut depth = 1usize;
-    let mut i = open_idx;
-    while i < tokens.len() {
-        if let Tok::Slash(word) = &tokens[i] {
-            if word == "begin" {
-                depth += 1;
-            } else if word == "end" {
-                depth -= 1;
-                if depth == 0 {
-                    let closed = tokens.get(i + 1).and_then(|t| match t {
-                        Tok::Word(name) => Some(name.clone()),
-                        _ => None,
-                    });
-                    return match closed {
-                        Some(name) if name == open => Ok(Some(i)),
-                        Some(name) => Err(CalError::MismatchedA2lBlock {
-                            opened: open.to_owned(),
-                            closed: name,
-                        }),
-                        None => Err(CalError::MalformedA2l(format!(
-                            "/end must be followed by a block keyword, closing {open}"
-                        ))),
-                    };
-                }
-            }
-        }
-        i += 1;
-    }
-    Ok(None)
-}
 
 /// Build a `CompuTable` from a `COMPU_TAB`/`COMPU_VTAB` body.
 fn parse_table(block: &str, body: &[Tok]) -> Result<Option<CompuTable>, CalError> {

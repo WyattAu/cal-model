@@ -27,71 +27,81 @@
 //!                          Snapshot ──► diff ──► CalibrationDelta report
 //! ```
 //!
-//! Four things happen here that no substrate does:
+//! Five things happen here that no substrate does:
 //!
 //! 1. **Reference resolution.** A characteristic whose `COMPU_METHOD` or
 //!    `RECORD_LAYOUT` is undeclared, or whose `COMPU_TAB_REF` has no
-//!    registered points, is a typed [`CalError::UnknownComputationTable`] —
-//!    never a silently defaulted conversion. A wrong conversion writes the
-//!    wrong number into an ECU.
-//! 2. **Inversion.** `to_physical` is evaluation; [`CalibrationProject::to_raw`]
-//!    is the part that matters, and it bracket-checks against the deposit's
-//!    datatype range so the tool cannot ask for a value the ECU cannot hold.
+//!    registered points, is a typed [`CalError::Unsupported`] — never a
+//!    silently defaulted conversion. A wrong conversion writes the wrong
+//!    number into an ECU.
+//! 2. **Inversion.** [`to_physical`](CalibrationProject::to_physical) is
+//!    evaluation; [`to_raw`](CalibrationProject::to_raw) is the part that
+//!    matters, and it bracket-checks against the deposit's datatype range so
+//!    the tool cannot ask for a value the ECU cannot hold.
 //! 3. **Transport framing.** [`XcpTransport`] is deliberately two methods
-//!    wide, which makes a session testable against a bench mock while
-//!    [`CalibrationSession`] hands a real bridge the exact memory access.
-//! 4. **Calibration arithmetic.** [`calibrate_curve`] fits a monotone
-//!    piecewise-linear curve through measured nodes; [`optimize_working_point`]
-//!    finds a bounded working point by deterministic coordinate descent.
-//!
-//! # What this layer re-reads from the A2L text
-//!
-//! `a2l-parse` deliberately keeps only the subset the stack consumes: it
-//! records a `COMPU_METHOD`'s `COMPU_TAB_REF` *name* and skips the
-//! `COMPU_TAB`/`COMPU_VTAB` block itself. A `TABLE` conversion is
-//! unimplementable without the tabulated points, so [`tables`] re-scans the
-//! description text for exactly those blocks — a small, total, independently
-//! tested scanner. Everything else comes from the substrate.
+//!    wide, which makes a session testable against [`mock::MockTransport`]
+//!    while [`CalibrationSession::upload_frames`] and friends hand a real
+//!    bridge the exact `xcp_core` frames to send.
+//! 4. **Verified writes.** A session write reads the value back and fails if
+//!    the ECU did not latch it.
+//! 5. **Calibration arithmetic.** [`calibrate_curve`] fits a monotone
+//!    piecewise-linear curve through measured nodes;
+//!    [`optimize_working_point`] finds a bounded working point by
+//!    deterministic coordinate descent.
 //!
 //! # Raw values are bit patterns
 //!
 //! Every raw value in this crate is the **memory bit pattern**, so a signed
 //! `SBYTE` characteristic holding −1 °C reads `0xFF`. Sign extension happens
-//! on the way into the conversion, and the reverse on the way out. This is
-//! what makes a read-modify-write cycle bit-exact: nothing is re-derived from
-//! a float.
+//! in [`Characteristic::raw_value`], on the way into the conversion, and in
+//! [`Characteristic::raw_bits`], on the way out. This is what makes a
+//! read-modify-write cycle bit-exact: nothing is re-derived from a float.
 //!
 //! # Example
 //!
 //! ```
-//! use cal_model::{CalibrationProject, CalError, MockTransport, ResourceMode, XcpTransport, SAMPLE_A2L};
+//! use cal_model::{
+//!     CalibrationProject, CalibrationSession, CalError, ResourceMode, XcpTransport, SAMPLE_A2L,
+//! };
 //! # fn main() -> Result<(), CalError> {
 //!
-//! // 1. Load the description and resolve it.
-//! let project = CalibrationProject::from_a2l(SAMPLE_A2L)?;
+//! // 1. Load the description and resolve every reference it makes.
+//! let mut project = CalibrationProject::from_a2l(SAMPLE_A2L)?;
+//! project.register_table("boost_curve_tab", vec![(0.0, 0.0), (6000.0, 150.0)])?;
+//! assert_eq!(project.module("engine")?.characteristics.len(), 9);
 //!
 //! // 2. Look a parameter up and convert both ways.
-//! let module = project.module("engine")?;
-//! assert_eq!(module.characteristics.len(), 9);
 //! let idle = project.characteristic("engine", "idle_target_rpm")?;
-//! assert_eq!(idle.address, 0x720104);
-//! // 3200 counts * 0.25 rpm/count = 800 rpm.
-//! assert!((project.to_physical("engine", "idle_target_rpm", 3200.0)? - 800.0).abs() < 1e-9);
+//! assert_eq!(idle.address, 0x720108);
+//! // 3200 counts · 0.25 rpm/count = 800 rpm.
+//! let physical = project.to_physical("engine", "idle_target_rpm", 3200)?;
+//! assert!((physical - 800.0).abs() < 1e-9, "{physical}");
 //! assert_eq!(project.to_raw("engine", "idle_target_rpm", 800.0)?, 3200);
 //!
 //! // 3. Limits are enforced on the way in.
-//! assert!(project.check_limits("engine", "idle_target_rpm", 3200).is_ok());
+//! project.check_limits("engine", "idle_target_rpm", 3200)?;
 //! assert!(project.check_limits("engine", "idle_target_rpm", 0).is_err());
 //!
-//! // 4. Read-modify-write against a bench mock.
-//! let mut session = cal_model::CalibrationSession::connect(
-//!     &project, Box::new(cal_model::seeded_transport(&project)?),
-//!     ResourceMode::CONNECT_NORMAL,
+//! // 4. Calibrate against a bench ECU: write, read back, diff.
+//! let bench = cal_model::mock::MockTransport::seeded(&cal_model::seed_memory());
+//! let mut session = CalibrationSession::connect(
+//!     &project, Box::new(bench), ResourceMode::CONNECT_NORMAL,
 //! )?;
-//! let before = session.read_characteristic("engine", "idle_target_rpm")?;
-//! assert!((before - 800.0).abs() < 1e-9);
+//! // The seed memory holds 800 rpm; the write is limit-checked (500…1200),
+//! // inverted through `rpm_lin`, and read back before it is reported.
 //! session.write_characteristic("engine", "idle_target_rpm", 900.0)?;
-//! assert!((session.read_characteristic("engine", "idle_target_rpm")? - 900.0).abs() < 1e-9);
+//! let live = session.read_characteristic("engine", "idle_target_rpm")?;
+//! assert!((live - 900.0).abs() < 1e-9, "{live}");
+//!
+//! // 5. Snapshot, adjust, and report the diff.
+//! let before = session.snapshot(&["idle_target_rpm", "eng_torque_max"])?;
+//! session.write_characteristic("engine", "idle_target_rpm", 950.0)?;
+//! let after = session.snapshot(&["idle_target_rpm", "eng_torque_max"])?;
+//! let deltas = cal_model::diff_snapshots(Some(&before), &after, &project);
+//! assert_eq!(deltas[0].before, 900.0);
+//! assert_eq!(deltas[0].after, 950.0);
+//! assert!((deltas[0].delta - 50.0).abs() < 1e-9);
+//! assert!(deltas[0].within_limits);
 //! # Ok(())
 //! # }
 //! ```
@@ -105,31 +115,25 @@
 mod calibrate;
 mod conversion;
 mod error;
-mod mock;
+pub mod mock;
 mod model;
 mod project;
-mod sample;
+pub mod sample;
 mod session;
 mod signal;
-mod tables;
 
-pub use calibrate::{
-    calibrate_curve, optimal_point, optimize_working_point, optimize_working_point_with_budget,
-    CalParameter, Curve,
-};
+pub use calibrate::{calibrate_curve, optimal_point, optimize_working_point, CalParameter, Curve};
 pub use conversion::CompuMethod;
+pub use dbc_parse::ByteOrder;
 pub use error::CalError;
-pub use mock::{MemoryPage, MockTransport};
 pub use model::{CharKind, Characteristic, Measurement, Module};
 pub use project::CalibrationProject;
-pub use sample::{seeded_transport, seed_values, SAMPLE_A2L, SAMPLE_DBC};
+pub use sample::{element_counts, sample_project, seed_memory, tables, SAMPLE_A2L, SAMPLE_DBC};
 pub use session::{
-    render_deltas, CalibrationDelta, CalibrationSession, Snapshot, SnapshotEntry, XcpTransport,
+    diff_snapshots, render_deltas, CalibrationDelta, CalibrationSession, Snapshot, SnapshotEntry,
+    SnapshotValue, XcpTransport,
 };
 pub use signal::SignalBinding;
-pub use tables::{CompuTabKind, CompuTable};
-
-pub use dbc_parse::ByteOrder;
 pub use xcp_core::ResourceMode;
 
 /// Re-export of the A2L substrate, so a consumer needs one dependency.

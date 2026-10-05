@@ -1,418 +1,493 @@
-//! Calibration arithmetic: monotone curve fitting and bounded working-point
-//! search.
+//! Calibration fitting: monotone piecewise-linear curves and bounded
+//! working-point optimisation.
 //!
-//! These are the two things a calibration engineer reaches for that are not
-//! protocol: turning measured bench points into a curve the ECU can hold,
-//! and finding the operating point that maximises a measured objective
-//! inside declared bounds.
+//! These are the two computations a calibration engineer reaches for when
+//! the ECU will not tell them the answer — a measured set of points that
+//! must become a curve the ECU can interpolate, and a set of adjustable
+//! parameters whose best combination has to be found inside their limits.
 //!
-//! # Determinism
+//! # Curve nodes are parameter *intervals*
 //!
-//! Both routines are **deterministic**: no random restarts, no
-//! wall-clock-dependent caps, no parallelism. A calibration result an
-//! engineer cannot reproduce is a result they cannot sign off, so the
-//! iteration budget is a fixed constant and the same inputs always produce
-//! the same curve.
+//! A [`CalParameter`] is one node of a curve under construction: `value` is
+//! the ordinate (the calibrated output at that node) and `lower`/`upper`
+//! are the abscissa bounds of the operating condition it was measured at —
+//! "`idle` between 700 and 900 rpm". The node's abscissa is the interval's
+//! midpoint, which is what makes the fit reproducible from the measurement
+//! record rather than from an implicit index order. Nodes are sorted by
+//! abscissa before the fit, so the caller may pass them in any order.
 //!
-//! # The abscissa of a fitted curve
+//! # Monotonicity is enforced, not assumed
 //!
-//! A calibration curve's knots are indexed by the **order of the
-//! parameters**, not by a measured input: the calibration engineer supplies
-//! them in ascending operating-point order, which is the order they are
-//! written into the deposit. [`Curve::xs`] is therefore `0..n`. A caller
-//! that has real abscissae and wants them reported can zip them in.
+//! A calibration curve whose ordinates change direction makes the ECU's
+//! interpolation physically wrong at the turn, so [`calibrate_curve`]
+//! rejects it with [`CalError::NonMonotone`] rather than fitting a curve
+//! that lies. Both directions are accepted — a gain that falls with
+//! temperature is as legitimate as one that rises with load.
+//!
+//! # The optimiser is deterministic
+//!
+//! [`optimize_working_point`] is bounded coordinate descent from a fixed
+//! set of starting points (each parameter's midpoint and the box corners),
+//! halving the step on every sweep without improvement. Same inputs, same
+//! answer, every run — which is the only acceptable behaviour for something
+//! that ends up in an ECU's flash. A non-finite objective is reported as
+//! [`CalError::Convergence`] carrying the iteration count, never silently
+//! returning a number from a diverged search.
 
 use crate::error::CalError;
+use std::cmp::Ordering;
+use std::fmt;
 
-/// One calibration parameter: a value inside a declared box.
+/// Sweep budget for coordinate descent before the optimiser gives up.
+const MAX_SWEEPS: u32 = 400;
+
+/// Relative step below which a sweep counts as converged.
+const STEP_TOLERANCE: f64 = 1e-9;
+
+/// One node of a curve under construction, or one adjustable of an
+/// optimisation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CalParameter {
-    /// Parameter name — the characteristic it came from.
+    /// What this node is — the operating condition or the parameter name.
     pub name: String,
-    /// The measured or proposed value.
+    /// For a curve node, the ordinate (the calibrated value). For an
+    /// adjustable, the starting point.
     pub value: f64,
-    /// Lower bound, on the same scale as `value`.
+    /// Lower bound: the abscissa interval's start (a curve node) or the
+    /// parameter's calibration limit.
     pub lower: f64,
-    /// Upper bound, on the same scale as `value`.
+    /// Upper bound: the abscissa interval's end (a curve node) or the
+    /// parameter's calibration limit.
     pub upper: f64,
 }
 
 impl CalParameter {
-    /// A parameter with bounds.
-    ///
-    /// # Errors
-    ///
-    /// [`CalError::NonFiniteValue`] for a non-finite value or bound, and
-    /// [`CalError::InfeasibleCurve`] when the bounds are the wrong way round
-    /// (`lower > upper`).
-    pub fn new(
-        name: impl Into<String>,
-        value: f64,
-        lower: f64,
-        upper: f64,
-    ) -> Result<Self, CalError> {
-        let parameter = Self {
+    /// A parameter with a name, a value, and bounds.
+    #[must_use]
+    pub fn new(name: impl Into<String>, value: f64, lower: f64, upper: f64) -> Self {
+        Self {
             name: name.into(),
             value,
             lower,
             upper,
-        };
-        if parameter.lower > parameter.upper {
-            return Err(CalError::InfeasibleCurve {
-                name: parameter.name.clone(),
-            });
         }
-        Ok(parameter)
     }
 
-    /// Check the value and bounds are usable.
-    ///
-    /// # Errors
-    ///
-    /// [`CalError::NonFiniteValue`] for a non-finite value or bound,
-    /// [`CalError::InfeasibleCurve`] for inverted bounds, and
-    /// [`CalError::OutOfBounds`] when `value` lies outside them.
-    pub fn validate(&self) -> Result<(), CalError> {
-        if !self.value.is_finite() || !self.lower.is_finite() || !self.upper.is_finite() {
-            return Err(CalError::NonFiniteValue {
-                name: self.name.clone(),
-                value: self.value,
-            });
-        }
-        if self.lower > self.upper {
-            return Err(CalError::InfeasibleCurve {
-                name: self.name.clone(),
-            });
-        }
-        if self.value < self.lower || self.value > self.upper {
-            return Err(CalError::OutOfBounds {
-                name: self.name.clone(),
-                value: self.value,
-                lower: self.lower,
-                upper: self.upper,
-            });
-        }
-        Ok(())
-    }
-
-    /// Clamp `candidate` into this parameter's bounds; a NaN maps to the
-    /// parameter's own value, so a bad proposal cannot poison a sweep.
+    /// The abscissa of a curve node: the midpoint of its interval.
     #[must_use]
-    pub fn clamp(&self, candidate: f64) -> f64 {
-        if candidate.is_nan() {
-            return self.value;
-        }
-        candidate.clamp(self.lower, self.upper)
+    pub fn midpoint(&self) -> f64 {
+        // f64::midpoint rather than (lower + upper) / 2.0: it cannot
+        // overflow on two finite bounds, which (a + b) cannot promise.
+        self.lower.midpoint(self.upper)
     }
 
-    /// The width of the parameter's box.
+    /// Clamp `x` into this parameter's bounds.
     #[must_use]
-    pub fn span(&self) -> f64 {
-        self.upper - self.lower
+    pub fn clamp(&self, x: f64) -> f64 {
+        if x < self.lower {
+            self.lower
+        } else if x > self.upper {
+            self.upper
+        } else {
+            x
+        }
     }
 }
 
-/// A fitted monotone piecewise-linear curve: the knots and the value at each.
-///
-/// This is the shape a `CURVE` or `MAP` characteristic holds, so a [`Curve`]
-/// can be written into a deposit once converted.
-#[derive(Debug, Clone, PartialEq, Default)]
+impl fmt::Display for CalParameter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} = {:.6} in [{:.6}, {:.6}]",
+            self.name, self.value, self.lower, self.upper
+        )
+    }
+}
+
+/// A monotone piecewise-linear calibration curve.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Curve {
-    /// The knots, strictly ascending.
-    pub xs: Vec<f64>,
-    /// The value at each knot, non-decreasing.
-    pub ys: Vec<f64>,
+    points: Vec<(f64, f64)>,
 }
 
 impl Curve {
-    /// A curve through `points`, with the knots taken in the order given.
+    /// Build a curve from `(abscissa, ordinate)` points.
     ///
     /// # Errors
     ///
-    /// As [`calibrate_curve`], applied to `points` in order.
-    pub fn through(points: &[(f64, f64)]) -> Result<Self, CalError> {
-        let parameters: Vec<CalParameter> = points
+    /// [`CalError::Unsupported`] when fewer than two points are given, when
+    /// the abscissae are not strictly ascending, or when any point is
+    /// non-finite.
+    pub fn new(points: Vec<(f64, f64)>) -> Result<Self, CalError> {
+        if points.len() < 2 {
+            return Err(CalError::Unsupported {
+                subject: "calibration curve".to_string(),
+                reason: format!("{} point(s) given, at least 2 are required", points.len()),
+            });
+        }
+        if points
             .iter()
-            .enumerate()
-            .map(|(index, (x, y))| CalParameter {
-                name: format!("knot{index}"),
-                value: *y,
-                lower: *x,
-                upper: *x,
-            })
-            .collect();
-        let mut curve = calibrate_curve(&parameters)?;
-        curve.xs = points.iter().map(|(x, _)| *x).collect();
-        Ok(curve)
+            .any(|&(x, y)| !x.is_finite() || !y.is_finite())
+        {
+            return Err(CalError::Unsupported {
+                subject: "calibration curve".to_string(),
+                reason: "points must be finite".to_string(),
+            });
+        }
+        // Ascending and strictly increasing: `partial_cmp` rather than a
+        // negated `<`, so a NaN abscissa is visibly incomparable rather than
+        // silently "not ascending".
+        if points.windows(2).any(|pair| match pair {
+            [first, second] => !matches!(first.0.partial_cmp(&second.0), Some(Ordering::Less)),
+            _ => true,
+        }) {
+            return Err(CalError::Unsupported {
+                subject: "calibration curve".to_string(),
+                reason: "abscissae must be strictly ascending".to_string(),
+            });
+        }
+        Ok(Self { points })
     }
 
-    /// Evaluate the curve at `x` by linear interpolation, clamping outside
-    /// the knot range to the endpoint values.
-    ///
-    /// A curve with no knots evaluates to `0.0` and a single-knot curve is
-    /// constant; neither can fail.
+    /// The fitted points, ascending by abscissa.
     #[must_use]
-    pub fn evaluate(&self, x: f64) -> f64 {
-        if self.xs.len() != self.ys.len() {
-            return 0.0;
+    pub fn points(&self) -> &[(f64, f64)] {
+        &self.points
+    }
+
+    /// Number of nodes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    /// `true` when the curve carries no nodes (never true for a curve built
+    /// through [`Curve::new`]).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+
+    /// `true` when the ordinates never change direction.
+    #[must_use]
+    pub fn is_monotone(&self) -> bool {
+        let mut rising = false;
+        let mut falling = false;
+        for pair in self.points.windows(2) {
+            let [first, second] = pair else { continue };
+            if second.1 > first.1 {
+                rising = true;
+            } else if second.1 < first.1 {
+                falling = true;
+            }
         }
-        if self.xs.is_empty() {
-            return 0.0;
-        }
-        if !x.is_finite() {
+        !(rising && falling)
+    }
+
+    /// Evaluate the curve at `x`: linear interpolation between the
+    /// bracketing nodes, clamped to the end nodes outside the domain (the
+    /// ASAP2 `TAB_INTP` convention).
+    #[must_use]
+    pub fn eval(&self, x: f64) -> f64 {
+        let Some(&(first_x, first_y)) = self.points.first() else {
             return f64::NAN;
-        }
-        let Some(first_x) = self.xs.first().copied() else {
-            return 0.0;
         };
-        let first_y = self.ys.first().copied().unwrap_or(0.0);
-        if self.xs.len() == 1 || x <= first_x {
+        if x <= first_x {
             return first_y;
         }
-        let Some(last_x) = self.xs.last().copied() else {
-            return 0.0;
+        let Some(&(last_x, last_y)) = self.points.last() else {
+            return f64::NAN;
         };
-        let last_y = self.ys.last().copied().unwrap_or(0.0);
         if x >= last_x {
             return last_y;
         }
-        // `partition_point` gives the first knot strictly above `x`, so the
-        // bracketing pair is (idx-1, idx).
-        let upper_index = self.xs.partition_point(|knot| *knot <= x).min(self.xs.len() - 1);
-        let Some(lower_index) = upper_index.checked_sub(1) else {
-            return first_y;
-        };
-        let (Some(lower_x), Some(upper_x)) = (self.xs.get(lower_index), self.xs.get(upper_index))
-        else {
-            return first_y;
-        };
-        let (Some(lower_y), Some(upper_y)) = (self.ys.get(lower_index), self.ys.get(upper_index))
-        else {
-            return first_y;
-        };
-        if *upper_x == *lower_x {
-            return *upper_y;
+        for pair in self.points.windows(2) {
+            let [first, second] = pair else { continue };
+            let (x0, y0) = *first;
+            let (x1, y1) = *second;
+            if x >= x0 && x <= x1 {
+                let span = x1 - x0;
+                if span == 0.0 {
+                    return y0;
+                }
+                return y0 + (y1 - y0) * (x - x0) / span;
+            }
         }
-        let weight = (x - lower_x) / (upper_x - lower_x);
-        lower_y + weight * (upper_y - lower_y)
-    }
-
-    /// The largest absolute difference between the curve and each supplied
-    /// point, for a fit-quality assertion.
-    #[must_use]
-    pub fn max_error_against(&self, xs: &[f64], ys: &[f64]) -> f64 {
-        xs.iter()
-            .zip(ys.iter())
-            .map(|(x, y)| (self.evaluate(*x) - y).abs())
-            .fold(0.0, f64::max)
-    }
-
-    /// `true` when the curve is non-decreasing across its knots.
-    #[must_use]
-    pub fn is_monotone(&self) -> bool {
-        self.ys.windows(2).all(|w| w[1] >= w[0])
-    }
-
-    /// The knots as `(x, y)` pairs.
-    #[must_use]
-    pub fn points(&self) -> Vec<(f64, f64)> {
-        self.xs
-            .iter()
-            .copied()
-            .zip(self.ys.iter().copied())
-            .collect()
+        last_y
     }
 }
 
-/// Fit a monotone piecewise-linear curve through the measured parameters.
+impl fmt::Display for Curve {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "calibration curve ({} points):", self.points.len())?;
+        for &(x, y) in &self.points {
+            writeln!(f, "  x = {x:>12.4}   y = {y:>12.6}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Fit a monotone piecewise-linear curve through the given nodes.
 ///
-/// The parameters are the curve's knots **in ascending operating-point
-/// order** — the order they are deposited — so the fit is the piecewise
-/// linear function through `(i, p[i].value)`.
-///
-/// Monotonicity is *checked*, not repaired. A controller handed a curve that
-/// rises and then falls is ambiguous, so contradictory bench data is a
-/// reportable defect: the engineer has two measurements that disagree and
-/// needs to know, not a silently smoothed curve that hides the disagreement.
-/// Each knot's declared bounds are validated too, because a knot outside its
-/// own limits is equally contradictory.
+/// Nodes are ordered by their abscissa (the midpoint of `lower..upper`) and
+/// the ordinates must not change direction. The fit reproduces every node
+/// exactly and interpolates linearly between them — which is precisely what
+/// an ECU's `TAB_INTP` conversion does, so what this returns is what the ECU
+/// will compute.
 ///
 /// # Errors
 ///
-/// [`CalError::NoParameters`] for an empty set, [`CalError::NonFiniteValue`],
-/// [`CalError::InfeasibleCurve`] when the values are **not** non-decreasing
-/// (the contradictory case), and [`CalError::OutOfBounds`] when a value lies
-/// outside its own declared bounds.
-pub fn calibrate_curve(parameters: &[CalParameter]) -> Result<Curve, CalError> {
-    if parameters.is_empty() {
-        return Err(CalError::NoParameters);
+/// [`CalError::Unsupported`] for fewer than two nodes, non-finite bounds, or
+/// two nodes sharing an abscissa; [`CalError::OutOfBounds`] when a node's
+/// `lower` exceeds its `upper`; [`CalError::NonMonotone`] when the ordinates
+/// change direction.
+pub fn calibrate_curve(params: &[CalParameter]) -> Result<Curve, CalError> {
+    let mut nodes: Vec<(f64, &CalParameter)> = Vec::with_capacity(params.len());
+    for param in params {
+        validate_bounds(param)?;
+        nodes.push((param.midpoint(), param));
     }
-    for parameter in parameters {
-        parameter.validate()?;
-    }
-    // Non-decreasing is the contract; the first pair that breaks it names
-    // the knot, so the engineer knows which measurement to redo.
-    for pair in parameters.windows(2) {
-        let (Some(first), Some(second)) = (pair.first(), pair.get(1)) else {
-            continue;
-        };
-        if second.value < first.value {
-            return Err(CalError::InfeasibleCurve {
-                name: second.name.clone(),
+    nodes.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.name.cmp(&b.1.name))
+    });
+    for pair in nodes.windows(2) {
+        let [first, second] = pair else { continue };
+        if first.0 == second.0 {
+            return Err(CalError::Unsupported {
+                subject: "calibration curve".to_string(),
+                reason: format!(
+                    "nodes `{}` and `{}` share the abscissa {}",
+                    first.1.name, second.1.name, first.0
+                ),
             });
         }
     }
-    Ok(Curve {
-        xs: (0..parameters.len()).map(|index| index as f64).collect(),
-        ys: parameters.iter().map(|parameter| parameter.value).collect(),
+    let mut points: Vec<(f64, f64)> = Vec::with_capacity(nodes.len());
+    let mut direction = 0_i8;
+    for (abscissa, param) in &nodes {
+        if let Some(&(_, previous)) = points.last() {
+            if param.value > previous && direction < 0 {
+                return Err(CalError::NonMonotone {
+                    name: param.name.clone(),
+                    value: param.value,
+                    previous,
+                });
+            }
+            if param.value < previous && direction > 0 {
+                return Err(CalError::NonMonotone {
+                    name: param.name.clone(),
+                    value: param.value,
+                    previous,
+                });
+            }
+            if param.value > previous {
+                direction = 1;
+            } else if param.value < previous {
+                direction = -1;
+            }
+        }
+        points.push((*abscissa, param.value));
+    }
+    Curve::new(points)
+}
+
+/// Check a parameter's bounds are usable.
+fn validate_bounds(param: &CalParameter) -> Result<(), CalError> {
+    if !param.lower.is_finite() || !param.upper.is_finite() || !param.value.is_finite() {
+        return Err(CalError::Unsupported {
+            subject: format!("parameter `{}`", param.name),
+            reason: "value and bounds must be finite".to_string(),
+        });
+    }
+    if param.lower > param.upper {
+        return Err(CalError::OutOfBounds {
+            name: param.name.clone(),
+            value: param.lower,
+            lower: param.lower,
+            upper: param.upper,
+        });
+    }
+    Ok(())
+}
+
+/// Maximise `objective` over the box defined by `params`, returning the
+/// point and its value.
+///
+/// Coordinate descent from each parameter's midpoint and from the box
+/// corners, halving the step after every sweep without improvement, until
+/// the step falls below [`STEP_TOLERANCE`] or [`MAX_SWEEPS`] sweeps pass.
+/// The returned point is always inside the box.
+///
+/// # Errors
+///
+/// [`CalError::OutOfBounds`] for an empty parameter set or a degenerate
+/// bound, [`CalError::Unsupported`] for non-finite bounds,
+/// [`CalError::Convergence`] when the objective never yields a finite value.
+pub fn optimal_point(
+    params: &[CalParameter],
+    objective: &dyn Fn(&[f64]) -> f64,
+) -> Result<(Vec<f64>, f64), CalError> {
+    if params.is_empty() {
+        return Err(CalError::Unsupported {
+            subject: "optimiser".to_string(),
+            reason: "no parameters to optimise".to_string(),
+        });
+    }
+    for param in params {
+        validate_bounds(param)?;
+    }
+    let n = params.len();
+    let widths: Vec<f64> = params.iter().map(|p| p.upper - p.lower).collect();
+
+    // Deterministic multi-start: the midpoint, then every corner of the box
+    // for small problems, so a descent that would otherwise stall in a
+    // corner's basin starts from that corner too.
+    let mut starts: Vec<Vec<f64>> = vec![params.iter().map(CalParameter::midpoint).collect()];
+    if n <= 8 {
+        for corner in 0..n {
+            for high_corner in [true, false] {
+                let mut point: Vec<f64> = params
+                    .iter()
+                    .map(|p| if high_corner { p.lower } else { p.upper })
+                    .collect();
+                let Some(param) = params.get(corner) else {
+                    continue;
+                };
+                let opposite = if high_corner {
+                    param.upper
+                } else {
+                    param.lower
+                };
+                if let Some(slot) = point.get_mut(corner) {
+                    *slot = opposite;
+                }
+                starts.push(point);
+            }
+        }
+    }
+
+    let mut best: Option<(Vec<f64>, f64)> = None;
+    let mut worst_sweeps = 0_u32;
+    for start in starts {
+        match descend(params, &widths, objective, start) {
+            Ok(found) => {
+                let replace = best.as_ref().is_none_or(|(_, value)| found.1 > *value);
+                if replace {
+                    best = Some(found);
+                }
+            }
+            Err(sweeps) => worst_sweeps = worst_sweeps.max(sweeps),
+        }
+    }
+    best.ok_or(CalError::Convergence {
+        iterations: worst_sweeps.max(1),
     })
 }
 
-/// Default iteration budget for [`optimize_working_point`].
-pub const DEFAULT_MAX_ITERATIONS: u32 = 200;
-/// Step multiplier after a productive sweep.
-const STEP_GROW: f64 = 1.6;
-/// Step multiplier after a sweep that found nothing.
-const STEP_SHRINK: f64 = 0.5;
-/// Step scale below which the search is declared settled.
-const STEP_FLOOR: f64 = 1e-12;
-
-/// Find the parameter setting that maximises `objective` inside the declared
-/// bounds, by deterministic coordinate descent.
+/// One coordinate-descent run from `start`.
 ///
-/// Each round sweeps every axis in order and slides it to the best of four
-/// candidate steps — outward, inward, and two intermediate scales — keeping
-/// the move when the objective improves. A sweep that improves nothing
-/// halves the step and the round repeats, so the search refines rather than
-/// restarts. It stops when the step scale falls below [`STEP_FLOOR`].
-///
-/// The result **never** leaves the box: every candidate is clamped to its
-/// parameter's bounds before it is scored, so the returned point is inside
-/// the bounds even when the objective is unbounded outside them.
-///
-/// # Errors
-///
-/// [`CalError::NoParameters`] for an empty set, [`CalError::NonFiniteValue`],
-/// [`CalError::InfeasibleCurve`] for inverted bounds, [`CalError::OutOfBounds`]
-/// for a value outside its bounds, and [`CalError::Convergence`] when the
-/// iteration budget runs out before the step scale settles.
-pub fn optimize_working_point(
-    parameters: &[CalParameter],
-    objective: &dyn Fn(&[f64]) -> f64,
-) -> Result<f64, CalError> {
-    Ok(descend(parameters, objective, DEFAULT_MAX_ITERATIONS)?.1)
-}
-
-/// [`optimize_working_point`], returning both the optimal setting and the
-/// objective value it attained.
-///
-/// The two are consistent by construction — one search, both results — so a
-/// caller can never report a value from a different point.
-///
-/// # Errors
-///
-/// Exactly as [`optimize_working_point`].
-pub fn optimal_point(
-    parameters: &[CalParameter],
-    objective: &dyn Fn(&[f64]) -> f64,
-) -> Result<(Vec<f64>, f64), CalError> {
-    descend(parameters, objective, DEFAULT_MAX_ITERATIONS)
-}
-
-/// [`optimize_working_point`] with an explicit iteration budget.
-///
-/// Exposed so a caller can bound the work — a GUI sweep, or a test that
-/// needs the non-convergence path.
-///
-/// # Errors
-///
-/// As [`optimize_working_point`], with `max_iterations` rounds attempted.
-pub fn optimize_working_point_with_budget(
-    parameters: &[CalParameter],
-    objective: &dyn Fn(&[f64]) -> f64,
-    max_iterations: u32,
-) -> Result<f64, CalError> {
-    Ok(descend(parameters, objective, max_iterations)?.1)
-}
-
-/// The descent itself: returns `(best point, best objective value)`.
+/// `Ok` carries the point and its value; `Err` carries the number of sweeps
+/// the run consumed before giving up.
 fn descend(
-    parameters: &[CalParameter],
+    params: &[CalParameter],
+    widths: &[f64],
     objective: &dyn Fn(&[f64]) -> f64,
-    max_iterations: u32,
-) -> Result<(Vec<f64>, f64), CalError> {
-    if parameters.is_empty() {
-        return Err(CalError::NoParameters);
+    mut point: Vec<f64>,
+) -> Result<(Vec<f64>, f64), u32> {
+    for (index, param) in params.iter().enumerate() {
+        if let Some(slot) = point.get_mut(index) {
+            *slot = param.clamp(*slot);
+        }
     }
-    for parameter in parameters {
-        parameter.validate()?;
-    }
-    if max_iterations == 0 {
-        return Err(CalError::Convergence { iterations: 0 });
-    }
-
-    let mut point: Vec<f64> = parameters.iter().map(|p| p.value).collect();
-    let mut best = objective(&point);
-    // A non-finite seed objective is reported as non-finite input rather
-    // than silently starting from a sweep that can never improve.
-    if !best.is_finite() {
-        return Err(CalError::NonFiniteValue {
-            name: "objective".to_owned(),
-            value: best,
-        });
-    }
-    let mut step = 1.0f64;
-
-    for iteration in 1..=max_iterations {
+    // A non-finite start is still worth walking away from (the box corners
+    // may well be finite), but a run that never sees a finite value reports
+    // failure rather than returning -inf as an answer.
+    let initial = objective(&point);
+    let mut value = if initial.is_finite() {
+        initial
+    } else {
+        f64::NEG_INFINITY
+    };
+    let mut steps: Vec<f64> = widths.iter().map(|w| 0.5 * w).collect();
+    let mut sweep = 0_u32;
+    loop {
+        if sweep >= MAX_SWEEPS {
+            return Err(MAX_SWEEPS);
+        }
+        sweep += 1;
         let mut improved = false;
-        for (axis, parameter) in parameters.iter().enumerate() {
-            let span = parameter.span();
-            if !span.is_finite() || span == 0.0 {
-                continue;
-            }
-            let current = point.get(axis).copied().unwrap_or(parameter.value);
-            for fraction in [STEP_GROW, 1.0, 1.0 / STEP_GROW, STEP_SHRINK] {
-                for sign in [1.0f64, -1.0] {
-                    let mut candidate = point.clone();
-                    if let Some(slot) = candidate.get_mut(axis) {
-                        *slot = parameter.clamp(current + sign * fraction * step * span);
-                    }
-                    let Some(slotted) = candidate.get(axis).copied() else {
-                        continue;
-                    };
-                    if slotted == current && fraction != 1.0 {
-                        // Already clamped to this end of the axis; trying
-                        // the mirror is the only thing left that can help.
-                        continue;
-                    }
-                    let score = objective(&candidate);
-                    if score.is_finite() && score > best {
-                        best = score;
-                        if let Some(slot) = point.get_mut(axis) {
-                            *slot = slotted;
-                        }
-                        improved = true;
-                        break;
-                    }
+        let mut attempted = false;
+        let mut finite_trial = false;
+        for index in 0..point.len() {
+            for direction in [1.0_f64, -1.0_f64] {
+                let step = steps.get(index).copied().unwrap_or(0.0);
+                let current = point.get(index).copied().unwrap_or(0.0);
+                let Some(param) = params.get(index) else {
+                    continue;
+                };
+                let trial = param.clamp(current + direction * step);
+                if trial == current {
+                    continue;
                 }
-                if improved {
+                attempted = true;
+                let mut candidate = point.clone();
+                if let Some(slot) = candidate.get_mut(index) {
+                    *slot = trial;
+                }
+                let score = objective(&candidate);
+                if !score.is_finite() {
+                    continue;
+                }
+                finite_trial = true;
+                if score > value {
+                    value = score;
+                    point = candidate;
+                    improved = true;
                     break;
                 }
             }
         }
         if improved {
-            step = (step * STEP_GROW).min(1.0);
-        } else {
-            step *= STEP_SHRINK;
-            if step < STEP_FLOOR {
-                return Ok((point, best));
+            continue;
+        }
+        if !finite_trial {
+            // No trial moved the needle. Either every trial was rejected as
+            // non-finite (a diverged objective — report it), or the box has
+            // collapsed to a point (there is nowhere left to search, which is
+            // a converged answer, not a failure).
+            return if attempted {
+                Err(sweep)
+            } else {
+                Ok((point, value))
+            };
+        }
+        let mut moving = false;
+        for step in &mut steps {
+            *step *= 0.5;
+            if *step > STEP_TOLERANCE {
+                moving = true;
             }
         }
-        if iteration == max_iterations {
-            return Err(CalError::Convergence {
-                iterations: iteration,
-            });
+        if !moving {
+            return Ok((point, value));
         }
     }
-    Ok((point, best))
+}
+
+/// Maximise `objective` over the box defined by `params` and return the best
+/// value found.
+///
+/// See [`optimal_point`] for the search itself and its guarantees; this is
+/// the value-only form calibration tools usually want.
+///
+/// # Errors
+///
+/// As [`optimal_point`].
+pub fn optimize_working_point(
+    params: &[CalParameter],
+    objective: &dyn Fn(&[f64]) -> f64,
+) -> Result<f64, CalError> {
+    optimal_point(params, objective).map(|(_, value)| value)
 }

@@ -1,694 +1,776 @@
-//! The calibration session: read-modify-write against an ECU, plus snapshot,
-//! restore, and diff.
+//! The calibration session: read-modify-write over an XCP transport, with
+//! page switching, snapshots, restore, and diffs.
 //!
-//! # Why the transport is two methods wide
+//! # The transport is a trait, not a wire protocol
 //!
-//! [`XcpTransport`] is `read`/`write` and nothing else. That is narrower than
-//! XCP, deliberately: XCP addresses every access through the MTA, so the
-//! protocol's verbosity (SET_MTA, then UPLOAD or DOWNLOAD, then the response
-//! parse) is a *framing* concern, not a calibration concern. Keeping it out
-//! of the session signature is what lets
-//! [`MockTransport`](crate::MockTransport) — plain memory — stand in for a
-//! real bus, and what lets [`CalibrationSession::set_cal_page`] be tested
-//! without a protocol stack.
+//! [`XcpTransport`] is two methods — read bytes at an ECU address, write
+//! bytes at an ECU address — plus an optional
+//! [`set_page`](XcpTransport::set_page). Everything above it (addressing,
+//! element coding, conversions, limits, paging) is this crate's job;
+//! everything below it (CTO framing, block mode, CAN IDs, transport-layer
+//! timing) is `xcp_core`'s and the caller's. A bench mock, a UDP XCP slave,
+//! and a SocketCAN bridge all satisfy the same three methods, which is what
+//! makes the session testable without an ECU — see [`crate::mock`].
 //!
-//! The `xcp-core` framing is still used, by [`CalibrationSession::upload_frames`]
-//! and friends: those hand a real bridge exactly the frames to transmit,
-//! already split into MTA and transfer packets. Nothing in the calibration
-//! path has to reimplement the protocol, and nothing outside it has to know
-//! it.
-
-use std::fmt;
-
-use xcp_core::{ByteOrder, ResourceMode};
+//! [`CalibrationSession`] also exposes the `xcp_core` command frames for
+//! each operation ([`upload_frames`](CalibrationSession::upload_frames),
+//! [`download_frames`](CalibrationSession::download_frames),
+//! [`set_cal_page_frame`](CalibrationSession::set_cal_page_frame)), so a
+//! caller that *is* a wire bridge builds the right frames instead of
+//! inventing them.
+//!
+//! # Writes are verified, not trusted
+//!
+//! `write_characteristic` checks the A2L limits, inverts the COMPU_METHOD,
+//! checks that the deposit can represent the result, reads back what it
+//! wrote, and fails if the read-back differs. A calibration tool that
+//! reports a write it cannot confirm is worse than one that reports an
+//! error.
 
 use crate::error::CalError;
 use crate::project::CalibrationProject;
+use std::fmt;
 
-/// `MAX_CTO` for classic XCP on CAN: the CTO packet size every CAN slave
-/// uses, and so the frame size the download sequence chunks at.
-const CAN_MAX_CTO: usize = 8;
-
-/// A memory-level transport to an ECU.
-///
-/// Implementations wrap whatever carries the bytes: a CAN bridge, a UDP
-/// gateway, or [`MockTransport`](crate::MockTransport). Address resolution
-/// and paging belong to the session, so an implementation need not know
-/// about either.
+/// Byte-level ECU memory access, as a calibration session needs it.
 pub trait XcpTransport {
-    /// Read `len` bytes starting at ECU address `addr`.
+    /// Read `len` bytes at ECU address `addr`.
     ///
     /// # Errors
     ///
-    /// [`CalError::Transport`] on a bus or link failure, and on an address
-    /// the target does not map.
+    /// [`CalError::Transport`] when the slave or the link failed; the
+    /// session surfaces the transport's own message unchanged.
     fn read(&mut self, addr: u32, len: u8) -> Result<Vec<u8>, CalError>;
 
-    /// Write `data` starting at ECU address `addr`.
+    /// Write `data` at ECU address `addr`.
     ///
     /// # Errors
     ///
-    /// [`CalError::Transport`] on a bus or link failure, and on an address
-    /// the target does not map.
+    /// [`CalError::Transport`] when the slave or the link failed.
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), CalError>;
+
+    /// Switch the slave's active calibration page (`SET_CAL_PAGE`).
+    ///
+    /// The default implementation accepts the switch without doing anything:
+    /// a transport over an ECU with a single calibration page has nothing to
+    /// do. A transport that multiplexes pages (or that forwards the command
+    /// to a real slave) overrides it.
+    ///
+    /// # Errors
+    ///
+    /// [`CalError::Transport`] when the slave rejected the switch.
+    fn set_page(&mut self, _page: u32) -> Result<(), CalError> {
+        Ok(())
+    }
+
+    /// This transport as `Any`, for a caller that wants to reach a concrete
+    /// implementation through the trait object (a test asserting on
+    /// [`MockTransport`](crate::mock::MockTransport)'s recorded traffic, say).
+    ///
+    /// The default returns `None` — an implementation opts in by overriding
+    /// it with `Some(self)`, so the trait stays object-safe and adding this
+    /// was never a breaking change.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
-/// One characteristic's captured value.
+/// One captured value of one characteristic element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotValue {
+    /// The memory bit pattern.
+    pub raw: u64,
+    /// The physical value the conversion produced.
+    pub physical: f64,
+}
+
+/// One characteristic as captured: every element it deposits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotEntry {
     /// The module the characteristic lives in.
     pub module: String,
     /// The characteristic name.
     pub name: String,
-    /// The physical value read at capture time.
-    pub value: f64,
-    /// The raw memory bit pattern, so a restore is bit-exact.
-    pub raw: u64,
+    /// Its elements, in deposit order.
+    pub elements: Vec<SnapshotValue>,
 }
 
-/// A named set of characteristic values captured from an ECU.
-///
-/// `PartialEq` compares by value, so "the ECU is back where it started" is a
-/// one-line assertion — and a property test can assert it over generated
-/// value sets.
-#[derive(Debug, Clone, Default, PartialEq)]
+impl SnapshotEntry {
+    /// The physical value of element `index`.
+    #[must_use]
+    pub fn physical(&self, index: usize) -> Option<f64> {
+        self.elements.get(index).map(|v| v.physical)
+    }
+
+    /// `name` or `name[index]`, the way a report refers to one element.
+    #[must_use]
+    pub fn element_name(&self, index: usize) -> String {
+        element_name(&self.name, self.elements.len(), index)
+    }
+}
+
+impl fmt::Display for SnapshotEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "  {}.{} ({} element{})",
+            self.module,
+            self.name,
+            self.elements.len(),
+            if self.elements.len() == 1 { "" } else { "s" }
+        )?;
+        for (index, value) in self.elements.iter().enumerate() {
+            write!(
+                f,
+                "\n    [{index}] raw 0x{:X} physical {:.6}",
+                value.raw, value.physical
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A captured calibration set: the values of every named characteristic,
+/// with the page they were read on.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Snapshot {
-    /// Captured values, in capture order.
+    /// The calibration page that was active when the capture started.
+    pub page: u32,
+    /// The captured characteristics, in capture order.
     pub entries: Vec<SnapshotEntry>,
 }
 
 impl Snapshot {
-    /// An empty snapshot.
+    /// An empty snapshot on page `page`.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn empty(page: u32) -> Self {
+        Self {
+            page,
+            entries: Vec::new(),
+        }
     }
 
-    /// The captured value of `name`.
+    /// The entry for `name` in `module`.
     #[must_use]
-    pub fn value(&self, name: &str) -> Option<f64> {
+    pub fn entry(&self, module: &str, name: &str) -> Option<&SnapshotEntry> {
         self.entries
             .iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| entry.value)
+            .find(|e| e.module == module && e.name == name)
     }
 
-    /// The captured raw pattern of `name`.
+    /// The entry for `name`, searched across every module.
     #[must_use]
-    pub fn raw(&self, name: &str) -> Option<u64> {
-        self.entries
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| entry.raw)
+    pub fn find(&self, name: &str) -> Option<&SnapshotEntry> {
+        self.entries.iter().find(|e| e.name == name)
     }
 
-    /// Number of captured characteristics.
+    /// The physical value of `name`'s first element.
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    pub fn physical(&self, name: &str) -> Option<f64> {
+        self.find(name).and_then(|entry| entry.physical(0))
     }
 
-    /// `true` when nothing was captured.
+    /// Total number of elements captured.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Add an entry.
-    pub fn push(&mut self, entry: SnapshotEntry) {
-        self.entries.push(entry);
-    }
-
-    /// A readable report of `other` measured against this snapshot.
-    ///
-    /// Lists **every** characteristic both snapshots share, marking the
-    /// changed ones, because a calibration report that silently omits an
-    /// unchanged parameter is the report an engineer stops trusting.
-    /// [`render_deltas`] is the changed-only form.
-    #[must_use]
-    pub fn report(&self, other: &Snapshot) -> String {
-        let mut lines = Vec::new();
-        let width = self
-            .entries
-            .iter()
-            .chain(other.entries.iter())
-            .map(|entry| entry.name.len())
-            .max()
-            .unwrap_or(0);
-        for entry in &self.entries {
-            let Some(counterpart) = other.entries.iter().find(|candidate| {
-                candidate.module == entry.module && candidate.name == entry.name
-            }) else {
-                continue;
-            };
-            #[allow(clippy::cast_precision_loss)]
-            let delta = counterpart.value - entry.value;
-            if delta == 0.0 {
-                continue;
-            }
-            #[allow(clippy::cast_precision_loss)]
-            let _ = lines.push(format!(
-                "{:width$}  {:>12.4} -> {:<12.4} ({:+11.4})",
-                entry.name, entry.value, counterpart.value, delta,
-                width = width
-            ));
-        }
-        if lines.is_empty() {
-            return "no calibration changes".to_owned();
-        }
-        lines.join("\n")
+    pub fn element_count(&self) -> usize {
+        self.entries.iter().map(|e| e.elements.len()).sum()
     }
 }
 
-/// One characteristic that changed between two snapshots.
+impl fmt::Display for Snapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "calibration snapshot: page {}, {} characteristic(s), {} element(s)",
+            self.page,
+            self.entries.len(),
+            self.element_count()
+        )?;
+        for entry in &self.entries {
+            writeln!(f, "{entry}")?;
+        }
+        Ok(())
+    }
+}
+
+/// One change between two calibration states.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CalibrationDelta {
-    /// The characteristic name.
+    /// The changed parameter: `characteristic`, or `characteristic[index]`
+    /// for a multi-element deposit.
     pub name: String,
-    /// The value in the earlier snapshot.
+    /// The value before the change (`NaN` when the parameter was not in the
+    /// "before" snapshot).
     pub before: f64,
-    /// The value in the later snapshot.
+    /// The value after the change.
     pub after: f64,
-    /// `after - before`.
+    /// `after - before` (`NaN` when `before` is `NaN`).
     pub delta: f64,
-    /// `true` when the **new** value sits inside the characteristic's
-    /// declared limits.
+    /// Whether `after` is inside the A2L limits of the characteristic.
     pub within_limits: bool,
 }
 
-/// Render changed characteristics as an aligned report.
-///
-/// Unchanged characteristics are omitted; [`Snapshot::report`] is the
-/// form that lists everything.
-#[must_use]
-pub fn render_deltas(deltas: &[CalibrationDelta]) -> String {
-    if deltas.is_empty() {
-        return "no calibration changes".to_owned();
+impl CalibrationDelta {
+    /// `true` when this parameter was absent from the "before" snapshot.
+    #[must_use]
+    pub fn is_new(&self) -> bool {
+        self.before.is_nan()
     }
-    let width = deltas
-        .iter()
-        .map(|delta| delta.name.len())
-        .max()
-        .unwrap_or(0);
-    let mut lines = Vec::with_capacity(deltas.len());
-    for delta in deltas {
-        #[allow(clippy::cast_precision_loss)]
-        let flag = if delta.within_limits {
-            ""
-        } else {
-            "  OUT OF LIMITS"
-        };
-        #[allow(clippy::cast_precision_loss)]
-        lines.push(format!(
-            "{:width$}  {:>12.4} -> {:<12.4} ({:+11.4}){flag}",
-            delta.name,
-            delta.before,
-            delta.after,
-            delta.delta,
-            width = width
-        ));
+
+    /// `true` when nothing moved.
+    #[must_use]
+    pub fn is_unchanged(&self) -> bool {
+        !self.is_new() && self.delta == 0.0
     }
-    lines.join("\n")
 }
 
-/// A live calibration session against one ECU.
+impl fmt::Display for CalibrationDelta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let verdict = if self.within_limits {
+            "ok"
+        } else {
+            "OUT OF LIMITS"
+        };
+        if self.is_new() {
+            write!(
+                f,
+                "{:<28} {:>14} {:>14.6} {:>14}  {verdict} (new)",
+                self.name, "-", self.after, "-"
+            )
+        } else {
+            write!(
+                f,
+                "{:<28} {:>14.6} {:>14.6} {:>+14.6}  {verdict}",
+                self.name, self.before, self.after, self.delta
+            )
+        }
+    }
+}
+
+/// Render a diff report: one header line, then one row per delta, then a
+/// summary.
+#[must_use]
+pub fn render_deltas(deltas: &[CalibrationDelta]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<28} {:>14} {:>14} {:>14}  limits",
+        "parameter", "before", "after", "delta"
+    );
+    for delta in deltas {
+        let _ = writeln!(out, "{delta}");
+    }
+    let changed = deltas.iter().filter(|d| !d.is_unchanged()).count();
+    let out_of_limits = deltas.iter().filter(|d| !d.within_limits).count();
+    let _ = writeln!(
+        out,
+        "-- {changed} changed, {} unchanged, {out_of_limits} out of limits",
+        deltas.len() - changed
+    );
+    out
+}
+
+/// Diff two calibration states: `before` → `after`, one entry per element,
+/// limit-checked against `project`'s current A2L limits.
+///
+/// A parameter present in `after` but not in `before` is reported with
+/// `before == NaN` ([`CalibrationDelta::is_new`]); a parameter only in
+/// `before` (removed between the two captures) is not reported, because the
+/// report describes the state being moved to.
+#[must_use]
+pub fn diff_snapshots(
+    before: Option<&Snapshot>,
+    after: &Snapshot,
+    project: &CalibrationProject,
+) -> Vec<CalibrationDelta> {
+    let mut deltas = Vec::new();
+    for entry in &after.entries {
+        let before_entry = before.and_then(|b| b.entry(&entry.module, &entry.name));
+        let characteristic = project.characteristic(&entry.module, &entry.name).ok();
+        for (index, value) in entry.elements.iter().enumerate() {
+            let before_value = before_entry
+                .and_then(|b| b.elements.get(index))
+                .map_or(f64::NAN, |v| v.physical);
+            let delta = if before_value.is_nan() {
+                f64::NAN
+            } else {
+                value.physical - before_value
+            };
+            let within_limits = characteristic.is_none_or(|c| c.within_limits(value.physical));
+            deltas.push(CalibrationDelta {
+                name: entry.element_name(index),
+                before: before_value,
+                after: value.physical,
+                delta,
+                within_limits,
+            });
+        }
+    }
+    deltas
+}
+
+/// A calibration session against one ECU, over one transport.
 pub struct CalibrationSession<'a> {
     project: &'a CalibrationProject,
-    transport: Box<dyn XcpTransport>,
+    transport: Box<dyn XcpTransport + 'a>,
     page: u32,
-    resource: ResourceMode,
-    byte_order: ByteOrder,
-    /// The most recent capture, the reference point for
-    /// [`CalibrationSession::diff`].
+    resources: xcp_core::ResourceMode,
     baseline: Option<Snapshot>,
 }
 
-impl fmt::Debug for CalibrationSession<'_> {
-    /// Hand-written so the trait object need not be `Debug`: a session holds
-    /// a boxed transport whose internals are the caller's business, and
-    /// printing them would leak bus details into a log.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CalibrationSession")
-            .field("page", &self.page)
-            .field("resource", &self.resource)
-            .field("byte_order", &self.byte_order)
-            .field("baseline_entries", &self.baseline.as_ref().map_or(0, Snapshot::len))
-            .finish_non_exhaustive()
-    }
-}
-
 impl<'a> CalibrationSession<'a> {
-    /// Open a session on `transport`, requesting `mode`'s resources.
+    /// Open a session on `project` over `transport`.
     ///
-    /// The requested mask is recorded and reported by
-    /// [`CalibrationSession::resource`]. A real bridge enforces it against
-    /// the CONNECT response; a mock has no protocol to negotiate.
-    ///
-    /// `CONNECT_NORMAL` and `CONNECT_USER_DEFINED` are mode bytes rather than
-    /// resource sets, so a session opened with one is treated as offering
-    /// `CAL/PAG` — the resource every calibration session needs.
+    /// `mode` is the slave's resource bitmask. When it is non-empty the
+    /// session requires [`ResourceMode::CAL_PAGE`](xcp_core::ResourceMode::CAL_PAGE)
+    /// and refuses to connect otherwise — a slave that advertises no CAL/PAG
+    /// resource cannot be calibrated, and finding that out at connect time
+    /// is much cheaper than finding it out at the first write. Pass the empty
+    /// mask ([`ResourceMode::CONNECT_NORMAL`]) to skip the check, which is
+    /// what a caller does when the transport is not completing a real CONNECT
+    /// handshake.
     ///
     /// # Errors
     ///
-    /// Never today; the signature is fallible so a transport that *does*
-    /// negotiate at connect time (and may refuse) fits without a break.
+    /// [`CalError::Xcp`] — [`xcp_core::XcpError::AccessDenied`] — when the
+    /// resource mask excludes CAL/PAG.
     pub fn connect(
         project: &'a CalibrationProject,
-        transport: Box<dyn XcpTransport>,
-        mode: ResourceMode,
+        transport: Box<dyn XcpTransport + 'a>,
+        mode: xcp_core::ResourceMode,
     ) -> Result<Self, CalError> {
+        if !mode.is_empty() && !mode.cal_page() {
+            return Err(CalError::Xcp(xcp_core::XcpError::AccessDenied));
+        }
         Ok(Self {
             project,
             transport,
             page: 0,
-            resource: mode,
-            byte_order: ByteOrder::Intel,
+            resources: mode,
             baseline: None,
         })
     }
 
-    /// The resource mask this session was opened with.
+    /// The project this session calibrates.
     #[must_use]
-    pub fn resource(&self) -> ResourceMode {
-        self.resource
+    pub const fn project(&self) -> &'a CalibrationProject {
+        self.project
     }
 
-    /// The current calibration page.
+    /// The transport, borrowed.
     #[must_use]
-    pub fn page(&self) -> u32 {
+    pub fn transport(&self) -> &dyn XcpTransport {
+        self.transport.as_ref()
+    }
+
+    /// The transport, mutably borrowed.
+    pub fn transport_mut(&mut self) -> &mut (dyn XcpTransport + 'a) {
+        self.transport.as_mut()
+    }
+
+    /// The negotiated resource mask.
+    #[must_use]
+    pub const fn resources(&self) -> xcp_core::ResourceMode {
+        self.resources
+    }
+
+    /// The active calibration page.
+    #[must_use]
+    pub const fn cal_page(&self) -> u32 {
         self.page
     }
 
-    /// The byte order multi-byte deposits are read and written in.
-    ///
-    /// Intel (little-endian) by default, matching `xcp-core`'s short-form
-    /// builders and the overwhelming majority of XCP slaves.
-    #[must_use]
-    pub fn byte_order(&self) -> ByteOrder {
-        self.byte_order
-    }
-
-    /// Set the byte order, as the CONNECT response's `COMM_MODE_BASIC`
-    /// advertises it.
-    pub fn set_byte_order(&mut self, byte_order: ByteOrder) {
-        self.byte_order = byte_order;
-    }
-
-    /// Switch the active calibration page.
-    ///
-    /// Mirrors `SET_CAL_PAGE`: subsequent addresses resolve into the new
-    /// page and the previous page's contents are untouched.
+    /// Switch the slave's active calibration page.
     ///
     /// # Errors
     ///
-    /// [`CalError::Transport`] when the session was opened without the
-    /// `CAL/PAG` resource, which [`ResourceMode::cal_page`] detects.
+    /// [`CalError::Transport`] when the transport rejected the switch; the
+    /// session's page is left unchanged in that case, so a failed switch
+    /// cannot silently redirect a later write to the wrong page.
     pub fn set_cal_page(&mut self, page: u32) -> Result<(), CalError> {
-        if !self.resource.cal_page() && !is_connect_mode(self.resource) {
-            return Err(CalError::Transport(
-                "the slave does not offer the CAL/PAG resource".to_owned(),
-            ));
-        }
+        self.transport.set_page(page)?;
         self.page = page;
         Ok(())
     }
 
-    /// Read a characteristic's physical value from the ECU.
+    /// The `SET_MTA` + `UPLOAD` frames for a read of `len` bytes at `addr`,
+    /// in the project's deposit byte order.
+    #[must_use]
+    pub fn upload_frames(&self, addr: u32, len: u8) -> Vec<u8> {
+        xcp_core::upload_with(self.project.deposit_byte_order(), addr, 0, len)
+    }
+
+    /// The `SET_MTA` + `DOWNLOAD` frames for a write of `data` at `addr`, in
+    /// the project's deposit byte order.
+    #[must_use]
+    pub fn download_frames(&self, addr: u32, data: &[u8]) -> Vec<u8> {
+        xcp_core::download_with(self.project.deposit_byte_order(), addr, 0, data)
+    }
+
+    /// The `SET_CAL_PAGE` frame for `page` (switch on the ECU, all
+    /// segments).
+    #[must_use]
+    pub fn set_cal_page_frame(&self, page: u32) -> Vec<u8> {
+        xcp_core::set_cal_page(self.project.deposit_byte_order(), 0x03, page as u16)
+    }
+
+    /// Read a characteristic and return the physical value of its first
+    /// element.
     ///
     /// # Errors
     ///
-    /// [`CalError::UnknownModule`], [`CalError::UnknownCharacteristic`],
-    /// [`CalError::UnsupportedConversion`] for a block deposit read as a
-    /// scalar, and [`CalError::Transport`] on a bus failure.
+    /// [`CalError::Transport`] on a bus failure, [`CalError::Unsupported`]
+    /// for an unresolvable conversion or a deposit the UPLOAD cannot carry,
+    /// plus the lookup errors.
     pub fn read_characteristic(&mut self, module: &str, name: &str) -> Result<f64, CalError> {
-        let (address, size) = self.scalar_deposit(module, name)?;
-        let bytes = self.transport.read(address, size)?;
-        let raw = decode(&bytes, self.byte_order)
-            .ok_or_else(|| CalError::Transport("the transport returned no bytes".to_owned()))?;
-        Ok(self
-            .project
-            .characteristic(module, name)?
-            .to_physical(raw))
+        let raws = self.read_characteristic_raw(module, name)?;
+        match raws.first() {
+            Some(&raw) => self.project.to_physical(module, name, raw),
+            // `elements == 0` is not rejected at declare_elements time (a
+            // zero-element curve is a legal if useless declaration), so the
+            // read path refuses it rather than indexing.
+            None => Err(CalError::Unsupported {
+                subject: format!("characteristic `{}`", qualified(module, name)),
+                reason: "the deposit declares no elements".to_string(),
+            }),
+        }
     }
 
-    /// Read a characteristic's raw memory bit pattern from the ECU.
+    /// Read every element of a characteristic and return their physical
+    /// values — the curve or map as one read.
     ///
     /// # Errors
     ///
-    /// As [`CalibrationSession::read_characteristic`].
-    pub fn read_raw(&mut self, module: &str, name: &str) -> Result<u64, CalError> {
-        let (address, size) = self.scalar_deposit(module, name)?;
-        let bytes = self.transport.read(address, size)?;
-        decode(&bytes, self.byte_order)
-            .ok_or_else(|| CalError::Transport("the transport returned no bytes".to_owned()))
+    /// As [`read_characteristic`](Self::read_characteristic).
+    pub fn read_characteristic_elements(
+        &mut self,
+        module: &str,
+        name: &str,
+    ) -> Result<Vec<f64>, CalError> {
+        let raws = self.read_characteristic_raw(module, name)?;
+        let characteristic = self.project.characteristic(module, name)?;
+        self.project.physical_values(characteristic, &raws)
     }
 
-    /// Write a characteristic's physical value to the ECU.
-    ///
-    /// The value is converted, limit-checked, and only then deposited — so an
-    /// out-of-range request never reaches the bus. This is the
-    /// read-modify-write cycle's write half, and it is the step that must
-    /// never be best-effort.
+    /// Read every element of a characteristic and return its raw bit
+    /// patterns.
     ///
     /// # Errors
     ///
-    /// As [`CalibrationProject::to_raw`], plus [`CalError::Transport`] on a
-    /// bus failure.
+    /// [`CalError::Transport`], [`CalError::Unsupported`] (including a
+    /// deposit larger than one 255-byte UPLOAD), plus the lookup errors.
+    pub fn read_characteristic_raw(
+        &mut self,
+        module: &str,
+        name: &str,
+    ) -> Result<Vec<u64>, CalError> {
+        let characteristic = self.project.characteristic(module, name)?;
+        let len = upload_len(characteristic)?;
+        let data = self.transport.read(characteristic.address, len)?;
+        self.project.read_raw(characteristic, &data)
+    }
+
+    /// Write a physical value to a characteristic's first element, and read
+    /// it back to confirm the ECU latched it.
+    ///
+    /// The value is limit-checked and inverted through the COMPU_METHOD
+    /// before anything reaches the bus, so a rejected write costs no
+    /// traffic.
+    ///
+    /// # Errors
+    ///
+    /// [`CalError::LimitViolation`] for an out-of-limit value,
+    /// [`CalError::OutOfBounds`] when the deposit cannot represent it,
+    /// [`CalError::Transport`] on a bus failure or a read-back mismatch,
+    /// plus the lookup errors.
     pub fn write_characteristic(
         &mut self,
         module: &str,
         name: &str,
         physical: f64,
     ) -> Result<(), CalError> {
-        let (address, size) = self.scalar_deposit(module, name)?;
-        // Convert first: a rejected value must not reach the transport.
-        let raw = self.project.to_raw(module, name, physical)?;
-        self.transport
-            .write(address, &encode(raw, usize::from(size), self.byte_order))
+        self.write_characteristic_element(module, name, 0, physical)
     }
 
-    /// Capture the current value of each named characteristic.
-    ///
-    /// The module is inferred: a name is resolved against every module, and
-    /// a name that appears in more than one is
-    /// [`CalError::AmbiguousSignal`]-shaped ambiguity — reported as
-    /// [`CalError::UnknownCharacteristic`] would hide the real cause, so this
-    /// returns a [`CalError::Transport`] naming both modules instead. Use
-    /// [`CalibrationSession::snapshot_module`] to name the module explicitly
-    /// and skip the search.
+    /// Write a physical value to one element of a characteristic and read
+    /// it back to confirm.
     ///
     /// # Errors
     ///
-    /// [`CalError::UnknownModule`], [`CalError::UnknownCharacteristic`],
-    /// [`CalError::Transport`] when a name is ambiguous, and
-    /// [`CalError::Transport`] on a bus failure.
-    pub fn snapshot(&mut self, names: &[&str]) -> Result<Snapshot, CalError> {
-        let mut entries = Vec::with_capacity(names.len());
-        for name in names {
-            let module = self.locate(name)?;
-            let value = self.read_characteristic(&module, name)?;
-            let raw = self.read_raw(&module, name)?;
-            entries.push(SnapshotEntry {
-                module,
-                name: (*name).to_owned(),
-                value,
-                raw,
-            });
-        }
-        let snapshot = Snapshot { entries };
-        self.baseline = Some(snapshot.clone());
-        Ok(snapshot)
-    }
-
-    /// Capture the current value of each named characteristic in `module`.
-    ///
-    /// # Errors
-    ///
-    /// [`CalError::UnknownModule`], [`CalError::UnknownCharacteristic`], and
-    /// [`CalError::Transport`] on a bus failure.
-    pub fn snapshot_module(
+    /// As [`write_characteristic`](Self::write_characteristic).
+    pub fn write_characteristic_element(
         &mut self,
         module: &str,
-        names: &[&str],
-    ) -> Result<Snapshot, CalError> {
-        // Resolve every name before any bus traffic, so a typo in the last
-        // entry does not leave the ECU half-read.
-        for name in names {
-            self.project.characteristic(module, name)?;
-        }
-        let mut entries = Vec::with_capacity(names.len());
-        for name in names {
-            let value = self.read_characteristic(module, name)?;
-            let raw = self.read_raw(module, name)?;
-            entries.push(SnapshotEntry {
-                module: module.to_owned(),
-                name: (*name).to_owned(),
-                value,
-                raw,
-            });
-        }
-        let snapshot = Snapshot { entries };
-        self.baseline = Some(snapshot.clone());
-        Ok(snapshot)
-    }
-
-    /// Write a snapshot's values back to the ECU.
-    ///
-    /// Restoring the captured **raw** pattern — not the physical value — is
-    /// what makes this exact: the round trip through the conversion is not
-    /// repeated on the way back, so even a value that does not survive a
-    /// float quantisation is restored bit-for-bit.
-    ///
-    /// # Errors
-    ///
-    /// [`CalError::UnknownModule`], [`CalError::UnknownCharacteristic`],
-    /// [`CalError::UnsupportedConversion`] for a block deposit, and
-    /// [`CalError::Transport`] on a bus failure.
-    pub fn restore(&mut self, snapshot: &Snapshot) -> Result<(), CalError> {
-        for entry in &snapshot.entries {
-            let size = self.scalar_deposit(&entry.module, &entry.name)?.1;
-            self.transport.write(
-                self.project
-                    .characteristic(&entry.module, &entry.name)?
-                    .address,
-                &encode(entry.raw, usize::from(size), self.byte_order),
-            )?;
+        name: &str,
+        index: usize,
+        physical: f64,
+    ) -> Result<(), CalError> {
+        let raw = self.project.to_raw(module, name, physical)?;
+        self.write_characteristic_raw(module, name, index, raw)?;
+        let confirm = self.read_characteristic_raw(module, name)?;
+        let latched = confirm.get(index).copied().unwrap_or(u64::MAX);
+        if latched != raw {
+            return Err(CalError::Transport(format!(
+                "write-back mismatch for `{}.{}` element {index}: wrote 0x{raw:X}, read 0x{latched:X}",
+                module, name
+            )));
         }
         Ok(())
     }
 
-    /// The characteristics that differ between this session's baseline and
-    /// `other`.
+    /// Write a raw bit pattern to one element, without limit checking or
+    /// read-back — the path a snapshot restore takes, where the value was
+    /// already validated when it was captured.
     ///
-    /// The baseline is the most recent snapshot the session captured, so
-    /// `before` is what the ECU held then and `after` is what `other` says
-    /// it holds now. A characteristic present in one snapshot and absent
-    /// from the other cannot be compared and is omitted; an unchanged value
-    /// is omitted too, so the result is a work list rather than a
-    /// transcript.
+    /// A multi-element deposit is read, one element replaced, and written
+    /// back whole: a calibration engineer adjusting curve point 3 must not
+    /// lose points 1, 2, and 4.
     ///
-    /// `within_limits` reports whether the **new** value sits inside the
-    /// characteristic's declared limits — the flag an engineer scans for.
+    /// # Errors
     ///
-    /// A session that has not captured a baseline yields no deltas; use
-    /// [`diff_snapshots`] to compare two snapshots directly.
-    #[must_use]
-    pub fn diff(&self, other: &Snapshot) -> Vec<CalibrationDelta> {
-        match &self.baseline {
-            Some(baseline) => diff_snapshots(baseline, other, self.project),
-            None => Vec::new(),
+    /// [`CalError::OutOfBounds`] when `index` is past the end of the
+    /// deposit, [`CalError::Transport`] on a bus failure, plus the lookup
+    /// errors.
+    pub fn write_characteristic_raw(
+        &mut self,
+        module: &str,
+        name: &str,
+        index: usize,
+        raw: u64,
+    ) -> Result<(), CalError> {
+        let characteristic = self.project.characteristic(module, name)?;
+        let elements = characteristic.elements.max(1);
+        if index >= elements {
+            return Err(CalError::OutOfBounds {
+                name: qualified(module, name),
+                value: index as f64,
+                lower: 0.0,
+                upper: (elements - 1) as f64,
+            });
         }
+        let mut raws = if characteristic.elements > 1 {
+            self.read_characteristic_raw(module, name)?
+        } else {
+            vec![0_u64; elements]
+        };
+        raws.resize(elements, 0);
+        if let Some(slot) = raws.get_mut(index) {
+            *slot = raw;
+        }
+        let data = self.project.write_raw(characteristic, &raws)?;
+        self.transport.write(characteristic.address, &data)
     }
 
-    /// The most recent snapshot this session captured, if any.
+    /// Read a measurement and return its physical value.
+    ///
+    /// # Errors
+    ///
+    /// [`CalError::Transport`] on a bus failure, [`CalError::Unsupported`]
+    /// for an unresolvable conversion, plus the lookup errors.
+    pub fn read_measurement(&mut self, module: &str, name: &str) -> Result<f64, CalError> {
+        let measurement = self.project.measurement(module, name)?;
+        let len = measurement.size_bytes();
+        if len == 0 || len > usize::from(u8::MAX) {
+            return Err(CalError::Unsupported {
+                subject: format!("measurement `{}.{}`", module, name),
+                reason: format!("{len}-byte measurement cannot be read in one UPLOAD"),
+            });
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let data = self.transport.read(measurement.address, len as u8)?;
+        let raw = decode_scalar(&data, measurement.is_signed());
+        let conversion = measurement.conversion.resolved(self.project.tables())?;
+        Ok(conversion.apply(raw))
+    }
+
+    /// Capture the named characteristics, searching every module for each
+    /// name (first declaration wins).
+    ///
+    /// The snapshot records the page it was taken on, so
+    /// [`restore`](Self::restore) puts the ECU back where it found it.
+    ///
+    /// # Errors
+    ///
+    /// As [`read_characteristic_raw`](Self::read_characteristic_raw), and
+    /// [`CalError::UnknownCharacteristic`] for a name no module declares.
+    pub fn snapshot(&mut self, names: &[&str]) -> Result<Snapshot, CalError> {
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            let (module_name, characteristic) = self.project.locate(name)?;
+            let module = module_name.to_string();
+            let raws = self.read_characteristic_raw(module_name, name)?;
+            entries.push(SnapshotEntry {
+                module,
+                name: characteristic.name.clone(),
+                elements: self.snapshot_values(characteristic, &raws)?,
+            });
+        }
+        Ok(Snapshot {
+            page: self.page,
+            entries,
+        })
+    }
+
+    /// Capture every characteristic of one module.
+    ///
+    /// # Errors
+    ///
+    /// As [`snapshot`](Self::snapshot).
+    pub fn snapshot_module(&mut self, module: &str) -> Result<Snapshot, CalError> {
+        let declared = self.project.module(module)?;
+        let names: Vec<String> = declared.characteristic_names().map(String::from).collect();
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut snapshot = self.snapshot(&borrowed)?;
+        for entry in &mut snapshot.entries {
+            entry.module = module.to_string();
+        }
+        Ok(snapshot)
+    }
+
+    /// Restore a captured calibration set: switch to the snapshot's page,
+    /// then write every captured raw value back verbatim.
+    ///
+    /// Raws are written, not physical values, so a restore is bit-exact and
+    /// cannot drift through a second round of inversion.
+    ///
+    /// # Errors
+    ///
+    /// [`CalError::Transport`], [`CalError::UnknownModule`] /
+    /// [`CalError::UnknownCharacteristic`] when the project no longer
+    /// declares a captured parameter, plus the write errors.
+    pub fn restore(&mut self, snapshot: &Snapshot) -> Result<(), CalError> {
+        self.set_cal_page(snapshot.page)?;
+        for entry in &snapshot.entries {
+            let characteristic = self.project.characteristic(&entry.module, &entry.name)?;
+            let raws: Vec<u64> = entry.elements.iter().map(|v| v.raw).collect();
+            let data = self.project.write_raw(characteristic, &raws)?;
+            self.transport.write(characteristic.address, &data)?;
+        }
+        Ok(())
+    }
+
+    /// Diff this session's **baseline** snapshot against `other`, one entry
+    /// per element.
+    ///
+    /// `&self` cannot read the bus, so the "before" side is the baseline
+    /// installed by [`set_baseline`](Self::set_baseline) (or
+    /// [`capture_baseline`](Self::capture_baseline)). With no baseline set,
+    /// every parameter is reported as new. Use [`diff_snapshots`] to diff two
+    /// snapshots you already hold.
+    ///
+    /// `within_limits` is evaluated against the project's current A2L
+    /// limits, so a baseline captured before a limit was tightened is
+    /// reported against the limit that now applies.
+    #[must_use]
+    pub fn diff(&self, other: &Snapshot) -> Vec<CalibrationDelta> {
+        diff_snapshots(self.baseline.as_ref(), other, self.project)
+    }
+
+    /// Install the baseline every [`diff`](Self::diff) measures against.
+    pub fn set_baseline(&mut self, snapshot: Snapshot) {
+        self.baseline = Some(snapshot);
+    }
+
+    /// The installed baseline, when one is set.
     #[must_use]
     pub fn baseline(&self) -> Option<&Snapshot> {
         self.baseline.as_ref()
     }
 
-    /// The XCP frames a bridge should send to upload `len` bytes from
-    /// `addr`: `SET_MTA` then `UPLOAD`.
+    /// Capture a baseline over every characteristic of every module and
+    /// install it.
     ///
     /// # Errors
     ///
-    /// [`CalError::UnsupportedConversion`] when the request is larger than
-    /// one transfer can carry, which a bridge must not silently split.
-    pub fn upload_frames(
-        &self,
-        addr: u32,
-        extension: u8,
-        len: u8,
-    ) -> Result<Vec<Vec<u8>>, CalError> {
-        Ok(vec![
-            xcp_core::set_mta(self.byte_order, addr, extension),
-            xcp_core::upload_with(self.byte_order, addr, extension, len),
-        ])
+    /// [`CalError::Transport`], [`CalError::UnknownModule`] /
+    /// [`CalError::UnknownCharacteristic`], [`CalError::Unsupported`] — as
+    /// [`snapshot`](Self::snapshot).
+    pub fn capture_baseline(&mut self) -> Result<(), CalError> {
+        let modules: Vec<String> = self.project.module_names().map(String::from).collect();
+        let mut entries = Vec::new();
+        let page = self.page;
+        for module in modules {
+            let mut snapshot = self.snapshot_module(&module)?;
+            entries.append(&mut snapshot.entries);
+        }
+        self.baseline = Some(Snapshot { page, entries });
+        Ok(())
     }
 
-    /// The XCP frames a bridge should send to download `data` to `addr`:
-    /// `SET_MTA` then a block-mode `DOWNLOAD` / `DOWNLOAD_NEXT` chain,
-    /// chunked to the slave's `MAX_CTO`.
-    ///
-    /// # Errors
-    ///
-    /// [`CalError::UnsupportedConversion`] when `data` is longer than the
-    /// protocol's absolute cap, and [`CalError::Transport`] when it is empty
-    /// — a `DOWNLOAD` of zero elements is a protocol error, not a no-op.
-    pub fn download_frames(
+    /// Convert raws into snapshot values.
+    fn snapshot_values(
         &self,
-        addr: u32,
-        extension: u8,
-        data: &[u8],
-    ) -> Result<Vec<Vec<u8>>, CalError> {
-        if data.is_empty() {
-            return Err(CalError::Transport(
-                "refusing to build a DOWNLOAD of zero elements".to_owned(),
-            ));
-        }
-        if data.len() > xcp_core::DOWNLOAD_MAX_CHUNK + xcp_core::DOWNLOAD_NEXT_MAX_CHUNK {
-            return Err(CalError::UnsupportedConversion {
-                name: format!("0x{addr:08X}"),
-                detail: "the block transfer exceeds the protocol's element cap",
-            });
-        }
-        Ok(xcp_core::download_with(self.byte_order, addr, extension, data)
-            .chunks(CAN_MAX_CTO)
-            .map(<[u8]>::to_vec)
+        characteristic: &crate::model::Characteristic,
+        raws: &[u64],
+    ) -> Result<Vec<SnapshotValue>, CalError> {
+        let conversion = self.project.resolved_conversion(characteristic)?;
+        Ok(raws
+            .iter()
+            .map(|&raw| SnapshotValue {
+                raw,
+                physical: conversion.apply(characteristic.raw_value(raw)),
+            })
             .collect())
     }
+}
 
-    /// The frames that select calibration page `page` in `segment`.
-    #[must_use]
-    pub fn cal_page_frames(&self, page: u32, segment: u16) -> Vec<u8> {
-        #[allow(clippy::cast_possible_truncation)]
-        let mode = (page & 0xFF) as u8;
-        xcp_core::set_cal_page(self.byte_order, mode, segment)
-    }
-
-    /// The project this session reads through.
-    #[must_use]
-    pub fn project(&self) -> &'a CalibrationProject {
-        self.project
-    }
-
-    /// The deposit `(address, element size)` for a scalar characteristic.
-    fn scalar_deposit(&self, module: &str, name: &str) -> Result<(u32, u8), CalError> {
-        let characteristic = self.project.characteristic(module, name)?;
-        let size = characteristic
-            .deposit_size()
-            .filter(|_| !characteristic.kind.is_block())
-            .ok_or_else(|| CalError::UnsupportedConversion {
-                name: characteristic.name.clone(),
-                detail: "a block deposit cannot be accessed as a scalar",
-            })?;
-        let size = u8::try_from(size).map_err(|_| CalError::UnsupportedConversion {
-            name: characteristic.name.clone(),
-            detail: "the deposit element is larger than one XCP transfer",
-        })?;
-        Ok((characteristic.address, size))
-    }
-
-    /// Find the single module declaring `name`.
-    fn locate(&self, name: &str) -> Result<String, CalError> {
-        let mut found: Option<&str> = None;
-        for module in self.project.modules() {
-            if module.characteristic(name).is_some() {
-                if let Some(previous) = found {
-                    return Err(CalError::Transport(format!(
-                        "characteristic `{name}` is declared in both module `{previous}` and `{}`",
-                        module.name
-                    )));
-                }
-                found = Some(&module.name);
-            }
-        }
-        found
-            .map(str::to_owned)
-            .ok_or_else(|| CalError::UnknownCharacteristic((*name).to_owned()))
+impl fmt::Debug for CalibrationSession<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CalibrationSession")
+            .field("page", &self.page)
+            .field("resources", &self.resources.to_string())
+            .finish_non_exhaustive()
     }
 }
 
-/// `true` when `resource` is a CONNECT mode byte rather than a resource set.
-fn is_connect_mode(resource: ResourceMode) -> bool {
-    resource == ResourceMode::CONNECT_NORMAL
-        || resource == ResourceMode::CONNECT_USER_DEFINED
-}
-
-/// Decode a raw count from a deposit buffer in `byte_order`.
+/// UPLOAD length for a characteristic's whole deposit record.
 ///
-/// # Total
-///
-/// A buffer shorter than the count's width is zero-extended and a longer one
-/// is truncated, matching `xcp-core`'s short-form builders. An empty buffer
-/// is `None`, because there is no value to report.
-#[must_use]
-fn decode(bytes: &[u8], byte_order: ByteOrder) -> Option<u64> {
-    // An empty buffer is `None`: the caller asked for a count and there is
-    // no value to report.
-    bytes.first()?;
-    let width = bytes.len().min(8);
-    let mut value = 0u64;
-    for (index, byte) in bytes.iter().take(8).enumerate() {
-        let shift = if byte_order == ByteOrder::Motorola {
-            8 * u32::try_from(width - 1 - index).unwrap_or(0)
-        } else {
-            8 * u32::try_from(index).unwrap_or(0)
-        };
-        value |= u64::from(*byte).wrapping_shl(shift);
-    }
-    Some(value)
-}
-
-/// Encode a raw count into a little- or big-endian buffer of `size` bytes.
-///
-/// # Total
-///
-/// A `size` of 0 yields an empty buffer and a `size` above 8 truncates the
-/// high bytes, which is what a deposit wider than the transfer implies.
-#[must_use]
-fn encode(value: u64, size: usize, byte_order: ByteOrder) -> Vec<u8> {
-    let width = size.min(8);
-    (0..size)
-        .map(|index| {
-            if index >= 8 {
-                return 0;
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let shift = if byte_order == ByteOrder::Motorola {
-                8 * (width - 1 - index.min(width - 1))
-            } else {
-                8 * index
-            };
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                (value >> shift.min(56)) as u8
-            }
-        })
-        .collect()
-}
-
-/// Compare two snapshots, flagging which changes land inside declared limits.
-///
-/// `before` supplies the earlier state and `after` the later one; `project`
-/// supplies the limits. A characteristic `project` does not declare is
-/// reported as within limits — there is no limit to violate, and reporting
-/// otherwise would train an engineer to ignore the flag.
-///
-/// An unchanged value is omitted, so the result is a work list rather than a
-/// transcript. [`CalibrationSession::diff`] is the session-bound form of this.
-#[must_use]
-pub fn diff_snapshots(
-    before: &Snapshot,
-    after: &Snapshot,
-    project: &CalibrationProject,
-) -> Vec<CalibrationDelta> {
-    let mut deltas = Vec::new();
-    for entry in &before.entries {
-        let Some(counterpart) = after
-            .entries
-            .iter()
-            .find(|candidate| candidate.module == entry.module && candidate.name == entry.name)
-        else {
-            continue;
-        };
-        #[allow(clippy::cast_precision_loss)]
-        let delta = counterpart.value - entry.value;
-        if delta == 0.0 {
-            continue;
-        }
-        let within_limits = project
-            .characteristic(&entry.module, &entry.name)
-            .is_ok_and(|characteristic| {
-                characteristic.lower_limit <= counterpart.value
-                    && counterpart.value <= characteristic.upper_limit
-            });
-        deltas.push(CalibrationDelta {
-            name: entry.name.clone(),
-            before: entry.value,
-            after: counterpart.value,
-            delta,
-            within_limits,
+/// The record includes the bytes *before* `FNC_VALUES POSITION`, which the
+/// layout reserves for other members of the record — the same span
+/// [`CalibrationProject::write_raw`] produces, so a read and a write of the
+/// same characteristic are the same length on the wire.
+fn upload_len(characteristic: &crate::model::Characteristic) -> Result<u8, CalError> {
+    let size = usize::from(characteristic.deposit_position) + characteristic.size_bytes();
+    if size == 0 || size > usize::from(u8::MAX) {
+        return Err(CalError::Unsupported {
+            subject: format!("characteristic `{}`", characteristic.name),
+            reason: format!("deposit of {size} bytes cannot be read in one UPLOAD"),
         });
     }
-    deltas
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(size as u8)
+}
+
+/// Decode one signed or unsigned integer from a measurement payload.
+fn decode_scalar(data: &[u8], is_signed: bool) -> f64 {
+    let mut value = 0_u64;
+    for (index, &byte) in data.iter().enumerate() {
+        value |= u64::from(byte) << (index * 8);
+    }
+    let bits = u32::try_from(data.len() * 8).unwrap_or(32);
+    if is_signed && bits > 0 && bits < 64 && value & (1_u64 << (bits - 1)) != 0 {
+        #[allow(clippy::cast_possible_wrap)]
+        let extended = (value | (u64::MAX << bits)) as i64;
+        extended as f64
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            value as f64
+        }
+    }
+}
+
+/// `name` for a single element, `name[index]` for a multi-element one.
+fn element_name(name: &str, elements: usize, index: usize) -> String {
+    if elements <= 1 {
+        name.to_string()
+    } else {
+        format!("{name}[{index}]")
+    }
+}
+
+/// `module.name`.
+fn qualified(module: &str, name: &str) -> String {
+    format!("{module}.{name}")
 }

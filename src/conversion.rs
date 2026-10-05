@@ -1,266 +1,497 @@
-//! The resolved conversion for one quantity: the A2L `COMPU_METHOD` plus,
-//! for a `TABLE` method, the points it refers to.
+//! The COMPU_METHOD conversion model: raw ↔ physical, in both directions.
+//!
+//! An A2L `COMPU_METHOD` is a pure function of the raw value stored in ECU
+//! memory. `a2l_parse` retains the *declaration* (conversion type,
+//! coefficients, `COMPU_TAB_REF`); this module turns that declaration into
+//! an evaluator ([`CompuMethod::apply`]) and — the part every calibration
+//! tool actually needs — an inverter ([`CompuMethod::invert`]).
+//!
+//! # Inversion is where the interesting failures live
+//!
+//! `to_raw` is not simply "undo the arithmetic". A physical value is only
+//! writable if the raw value that produces it exists inside the deposit's
+//! datatype range, so [`CompuMethod::invert`] takes the raw bounds
+//! (`value_min`, `value_max`) and reports [`CalError::OutOfBounds`] when the
+//! target is not bracketed by them. That is the check that stops a
+//! calibration engineer from writing a value the ECU would latch as
+//! something else entirely.
+//!
+//! # TABLE conversions
+//!
+//! `a2l_parse` retains the `COMPU_TAB_REF` *name* but not the `COMPU_TAB`
+//! points (the ASAP2 format stores them in a separate block, which the L1
+//! parser skips as an unknown sub-block). [`CompuMethod::Table`] therefore
+//! carries an empty point list until the points are registered on the
+//! project ([`CalibrationProject::register_table`](crate::CalibrationProject::register_table))
+//! or set directly. [`CompuMethod::apply`] stays **total** on an empty
+//! table (it falls back to the identity function); it is
+//! [`CalibrationProject`](crate::CalibrationProject) — the layer that knows
+//! the project — that refuses to resolve a table with no points, so an
+//! unresolvable conversion is a typed error rather than a silently wrong
+//! number.
 
-use a2l_parse::{Coeffs, CompuMethod as A2lCompuMethod, ConversionType, LinearFn};
+use crate::CalError;
+use std::collections::BTreeMap;
 
-use crate::error::CalError;
-use crate::tables::{CompuTabKind, CompuTable, TableSet};
+/// Bisection steps used to invert a rational conversion. 128 halvings of a
+/// 32-bit raw range land far below the 1e-9 tolerance the rest of the stack
+/// works to.
+const BISECTION_STEPS: usize = 128;
 
-/// A `COMPU_METHOD` resolved against the tables of its project.
-///
-/// This is a thin wrapper over [`a2l_parse::CompuMethod`] that adds the one
-/// thing the substrate cannot supply: the `COMPU_TAB` points a `TABLE`
-/// method needs in order to be evaluated.
+/// A raw ↔ physical conversion, driven by an A2L `COMPU_METHOD`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CompuMethod {
-    /// The substrate's declaration, kept verbatim.
-    pub method: A2lCompuMethod,
-    /// The tabulated points, for a `TABLE` method. `None` otherwise, or when
-    /// the referenced `COMPU_TAB` was not recovered from the description.
-    table: Option<CompuTable>,
+pub enum CompuMethod {
+    /// `IDENTITY` (also spelled `IDENTICAL`): `f(x) = x`.
+    Identity,
+    /// `LINEAR` — `f(x) = slope · x + intercept`.
+    Linear {
+        /// Multiplicative term (`COEFFS_LINEAR` `a`).
+        slope: f64,
+        /// Additive term (`COEFFS_LINEAR` `b`).
+        intercept: f64,
+    },
+    /// `RAT_FUNC` — `f(x) = (a·x² + b·x + c) / (d·x² + e·x + f)`, the six
+    /// `COEFFS` in the spec's own notation. Reducible-linear forms (the
+    /// common case, `d = e = a = 0`) are evaluated as written, which is
+    /// both faster and free of any reduction's rounding.
+    RatFunc {
+        /// `COEFFS a b c d e f`.
+        coeffs: [f64; 6],
+    },
+    /// `TABLE` — a conversion through tabulated points. `points` are
+    /// `(raw, physical)` pairs ascending by raw; `interpolate` is `true` for
+    /// `TAB_INTP` (piecewise-linear, the ASAP2 default) and `false` for
+    /// `TAB_NOINTP`/`TAB_VERB` (step lookup, nearest point wins).
+    Table {
+        /// The `COMPU_TAB_REF` name, when the declaration carried one.
+        tab_ref: Option<String>,
+        /// `(raw, physical)` points, ascending by raw.
+        points: Vec<(f64, f64)>,
+        /// `TAB_INTP` interpolation (`true`) or step lookup (`false`).
+        interpolate: bool,
+    },
 }
 
 impl CompuMethod {
-    /// Resolve `method`, attaching `tables`' points when it is a `TABLE`.
+    /// `IDENTITY` — the passthrough conversion.
     #[must_use]
-    pub fn new(method: A2lCompuMethod, tables: &TableSet) -> Self {
-        let table = method
-            .tab_ref
-            .as_ref()
-            .and_then(|name| tables.get(name).cloned());
-        Self { method, table }
+    pub const fn identity() -> Self {
+        Self::Identity
     }
 
-    /// Attach (or replace) the tabulated points for a `TABLE` method.
+    /// `LINEAR` — `f(x) = slope · x + intercept`.
     #[must_use]
-    pub fn with_table(mut self, table: CompuTable) -> Self {
-        self.table = Some(table);
-        self
+    pub const fn linear(slope: f64, intercept: f64) -> Self {
+        Self::Linear { slope, intercept }
     }
 
-    /// The conversion type keyword.
+    /// `RAT_FUNC` — `f(x) = (a·x² + b·x + c) / (d·x² + e·x + f)`.
     #[must_use]
-    pub const fn conversion_type(&self) -> ConversionType {
-        self.method.conversion_type
+    pub const fn rat_func(coeffs: [f64; 6]) -> Self {
+        Self::RatFunc { coeffs }
     }
 
-    /// The physical unit, possibly empty.
+    /// `TAB_INTP` — an interpolated table conversion.
     #[must_use]
-    pub fn unit(&self) -> &str {
-        &self.method.unit
-    }
-
-    /// The tabulated points, for a `TABLE` method.
-    #[must_use]
-    pub fn table(&self) -> Option<&CompuTable> {
-        self.table.as_ref()
-    }
-
-    /// Reduce to a linear raw → physical function, when the conversion is
-    /// linear or reducibly rational.
-    ///
-    /// Delegates to the substrate, which owns the reduction rules. Note this
-    /// applies to **raw counts**, not to physical units.
-    #[must_use]
-    pub fn to_linear(&self) -> Option<LinearFn> {
-        self.method.to_linear()
-    }
-
-    /// `true` when this conversion has a single-valued inverse — i.e. it is
-    /// monotone over its operating range. [`CompuMethod::to_raw`] needs this;
-    /// a table that folds back on itself does not have a usable inverse.
-    #[must_use]
-    pub fn is_monotone(&self) -> bool {
-        match self.method.conversion_type {
-            ConversionType::Identity => true,
-            ConversionType::Linear => {
-                matches!(self.method.coeffs, Coeffs::Linear([slope, _]) if slope != 0.0)
-            }
-            ConversionType::RatFunc => self.rational_numerator_is_affine(),
-            ConversionType::Table => self.table.as_ref().is_some_and(|table| {
-                table.kind == CompuTabKind::Intp
-                    && table.points.windows(2).all(|w| w[1].1 >= w[0].1)
-            }),
+    pub fn tab_intp(points: Vec<(f64, f64)>) -> Self {
+        Self::Table {
+            tab_ref: None,
+            points,
+            interpolate: true,
         }
     }
 
-    /// Convert a raw count to its physical value.
-    ///
-    /// Total: non-finite input yields a non-finite result rather than a
-    /// panic, and the NaN propagates to the limit check, which is where it
-    /// becomes a typed [`CalError::NonFiniteValue`].
+    /// `TAB_NOINTP`/`TAB_VERB` — a stepped table conversion.
     #[must_use]
-    pub fn to_physical(&self, raw: f64) -> f64 {
-        match self.method.conversion_type {
-            ConversionType::Identity => raw,
-            ConversionType::Linear => match self.method.coeffs {
-                Coeffs::Linear([a, b]) => a * raw + b,
-                _ => raw,
+    pub fn tab_no_intp(points: Vec<(f64, f64)>) -> Self {
+        Self::Table {
+            tab_ref: None,
+            points,
+            interpolate: false,
+        }
+    }
+
+    /// Build the conversion carried by an [`a2l_parse::CompuMethod`].
+    ///
+    /// A `TABLE` declaration arrives with its `COMPU_TAB_REF` name and an
+    /// empty point list; the points are registered on the project.
+    #[must_use]
+    pub fn from_a2l(method: &a2l_parse::CompuMethod) -> Self {
+        match method.conversion_type {
+            a2l_parse::ConversionType::Identity => Self::Identity,
+            a2l_parse::ConversionType::Linear => match method.coeffs {
+                a2l_parse::Coeffs::Linear([slope, intercept]) => Self::Linear { slope, intercept },
+                // A LINEAR method without COEFFS_LINEAR: the format requires
+                // the keyword, but a sloppy generator omits it. a2l_parse
+                // models that as Coeffs::None; identity is the only reading
+                // that cannot invent a wrong scale.
+                _ => Self::Identity,
             },
-            ConversionType::RatFunc => self.rational(raw),
-            ConversionType::Table => self
-                .table
-                .as_ref()
-                .map_or(raw, |table| table.evaluate(raw)),
+            a2l_parse::ConversionType::RatFunc => match method.coeffs {
+                a2l_parse::Coeffs::RatFunc(coeffs) => Self::RatFunc { coeffs },
+                _ => Self::Identity,
+            },
+            a2l_parse::ConversionType::Table => Self::Table {
+                tab_ref: method.tab_ref.clone(),
+                points: Vec::new(),
+                interpolate: true,
+            },
         }
     }
 
-    /// Convert a physical value back to an **unsigned** raw count.
+    /// The A2L conversion-type keyword this method came from
+    /// (`LINEAR`, `RAT_FUNC`, `TABLE`, `IDENTITY`).
+    #[must_use]
+    pub const fn keyword(&self) -> &'static str {
+        match self {
+            Self::Identity => "IDENTITY",
+            Self::Linear { .. } => "LINEAR",
+            Self::RatFunc { .. } => "RAT_FUNC",
+            Self::Table { .. } => "TABLE",
+        }
+    }
+
+    /// The tabulated points, empty for every non-`TABLE` method.
+    #[must_use]
+    pub fn points(&self) -> &[(f64, f64)] {
+        match self {
+            Self::Table { points, .. } => points,
+            _ => &[],
+        }
+    }
+
+    /// The `COMPU_TAB_REF` name, when the declaration carried one.
+    #[must_use]
+    pub fn tab_ref(&self) -> Option<&str> {
+        match self {
+            Self::Table { tab_ref, .. } => tab_ref.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// `true` for the passthrough conversion.
+    #[must_use]
+    pub const fn is_identity(&self) -> bool {
+        matches!(self, Self::Identity)
+    }
+
+    /// Replace the point list of a `TABLE` method (a no-op otherwise).
+    pub fn set_points(&mut self, points: Vec<(f64, f64)>) {
+        if let Self::Table { points: slot, .. } = self {
+            *slot = points;
+        }
+    }
+
+    /// Fill in the points of a `TABLE` method from the project's table
+    /// registry when it carries none of its own.
     ///
     /// # Errors
     ///
-    /// [`CalError::NonFiniteValue`] for a non-finite physical value, and
-    /// [`CalError::UnsupportedConversion`] when the conversion is not
-    /// single-valued invertible: a `TABLE` with no recovered points, a
-    /// non-affine `RAT_FUNC`, a zero slope, or a discriminant below zero.
-    pub fn to_raw(&self, physical: f64) -> Result<u64, CalError> {
-        Ok(self.to_raw_i64(physical)?.unsigned_abs())
+    /// [`CalError::Unsupported`] when a `TABLE` conversion cannot be
+    /// resolved: no points of its own and no registered `COMPU_TAB_REF`.
+    pub fn resolved(&self, tables: &BTreeMap<String, Vec<(f64, f64)>>) -> Result<Self, CalError> {
+        let Self::Table {
+            tab_ref,
+            points,
+            interpolate,
+        } = self
+        else {
+            return Ok(self.clone());
+        };
+        if !points.is_empty() {
+            return Ok(self.clone());
+        }
+        let Some(name) = tab_ref else {
+            return Err(CalError::Unsupported {
+                subject: "TABLE conversion".to_string(),
+                reason: "no points and no COMPU_TAB_REF to resolve them from".to_string(),
+            });
+        };
+        let Some(found) = tables.get(name.as_str()) else {
+            return Err(CalError::Unsupported {
+                subject: format!("COMPU_TAB_REF `{name}`"),
+                reason: "no table registered under that name".to_string(),
+            });
+        };
+        if found.is_empty() {
+            return Err(CalError::Unsupported {
+                subject: format!("COMPU_TAB_REF `{name}`"),
+                reason: "the registered table has no points".to_string(),
+            });
+        }
+        Ok(Self::Table {
+            tab_ref: tab_ref.clone(),
+            points: found.clone(),
+            interpolate: *interpolate,
+        })
     }
 
-    /// Convert a physical value back to a **signed** raw count.
+    /// Evaluate the conversion: raw value in, physical value out.
     ///
-    /// This is the form a signed deposit needs: an `SBYTE` holding −1 °C is
-    /// the count −1, and [`Characteristic::signed_value`](crate::Characteristic::signed_value)
-    /// re-encodes it into the memory bit pattern.
+    /// Total — no input panics and every variant is a plain evaluation. A
+    /// `TABLE` with no points evaluates as the identity; use
+    /// [`CompuMethod::resolved`] first when completeness matters.
+    #[must_use]
+    pub fn apply(&self, raw: f64) -> f64 {
+        match self {
+            Self::Identity => raw,
+            Self::Linear { slope, intercept } => slope * raw + intercept,
+            Self::RatFunc { coeffs } => {
+                let [a, b, c, d, e, f] = *coeffs;
+                // f64 division by zero is infinity/NaN, never a panic: a
+                // degenerate denominator yields a non-finite physical value,
+                // which every caller rejects through its limit check.
+                let x = raw;
+                (a * x * x + b * x + c) / (d * x * x + e * x + f)
+            }
+            Self::Table {
+                points,
+                interpolate,
+                ..
+            } => table_apply(points, *interpolate, raw),
+        }
+    }
+
+    /// Invert the conversion: physical value in, raw value out, bracketed
+    /// by the deposit's raw bounds `value_min`/`value_max` (in physical
+    /// units, after sign extension).
+    ///
+    /// * `IDENTITY` and `LINEAR` are closed-form (a zero slope is not
+    ///   invertible and is reported as [`CalError::Unsupported`]).
+    /// * `RAT_FUNC` is inverted by bisection over `[value_min, value_max]`,
+    ///   which needs no derivative and is exact to well under one raw count
+    ///   across the whole 64-bit range.
+    /// * `TABLE` inverts segment-wise, linearly for `TAB_INTP` and by
+    ///   nearest point for a stepped table.
+    ///
+    /// `name` is the characteristic the inversion is for; it appears in the
+    /// error so a session log says which parameter failed.
     ///
     /// # Errors
     ///
-    /// As [`CompuMethod::to_raw`].
-    pub fn to_raw_i64(&self, physical: f64) -> Result<i64, CalError> {
-        if !physical.is_finite() {
-            return Err(CalError::NonFiniteValue {
-                name: self.method.name.clone(),
-                value: physical,
-            });
-        }
-        let raw = match self.method.conversion_type {
-            ConversionType::Identity => physical,
-            ConversionType::Linear => match self.method.coeffs {
-                Coeffs::Linear([slope, intercept]) if slope != 0.0 => (physical - intercept) / slope,
-                _ => {
-                    return Err(CalError::UnsupportedConversion {
-                        name: self.method.name.clone(),
-                        detail: "a zero-slope LINEAR conversion has no inverse",
-                    })
+    /// [`CalError::Unsupported`] when the conversion is not invertible (zero
+    /// slope, or a `TABLE` with no points), [`CalError::OutOfBounds`] when
+    /// the physical value is not produced anywhere inside
+    /// `[value_min, value_max]`.
+    pub fn invert(
+        &self,
+        name: &str,
+        physical: f64,
+        value_min: f64,
+        value_max: f64,
+    ) -> Result<f64, CalError> {
+        match self {
+            Self::Identity => in_range(name, physical, value_min, value_max),
+            Self::Linear { slope, intercept } => {
+                if *slope == 0.0 || !slope.is_finite() {
+                    return Err(CalError::Unsupported {
+                        subject: format!("`{name}`"),
+                        reason: format!("linear conversion with slope {slope} is not invertible"),
+                    });
                 }
-            },
-            ConversionType::RatFunc => self.invert_rational(physical)?,
-            ConversionType::Table => {
-                let Some(table) = self.table.as_ref() else {
-                    return Err(CalError::UnknownComputationTable(
-                        self.method.tab_ref.clone().unwrap_or_default(),
-                    ));
-                };
-                match table.kind {
-                    CompuTabKind::Verb => table.invert_verb(physical),
-                    CompuTabKind::Intp => table.invert_intp(physical),
-                }
-                .ok_or(CalError::UnsupportedConversion {
-                    name: self.method.name.clone(),
-                    detail: "the tabulated points do not invert to a single input",
-                })?
+                in_range(name, (physical - intercept) / slope, value_min, value_max)
             }
-        };
-        if !raw.is_finite() {
-            return Err(CalError::UnsupportedConversion {
-                name: self.method.name.clone(),
-                detail: "the inverse is not finite over the reals",
-            });
+            Self::RatFunc { .. } => bisect(self, name, physical, value_min, value_max),
+            Self::Table {
+                points,
+                interpolate,
+                ..
+            } => table_invert(points, *interpolate, name, physical, value_min, value_max),
         }
-        Ok(round_half_away(raw))
-    }
-
-    /// `f(x) = (a·x² + b·x + c) / (d·x² + e·x + f)` from
-    /// `COEFFS a b c d e f`.
-    fn rational(&self, raw: f64) -> f64 {
-        match self.method.coeffs {
-            Coeffs::RatFunc([a, b, c, d, e, f]) => {
-                let numerator = (a * raw + b) * raw + c;
-                let denominator = (d * raw + e) * raw + f;
-                if denominator == 0.0 {
-                    f64::NAN
-                } else {
-                    numerator / denominator
-                }
-            }
-            _ => raw,
-        }
-    }
-
-    /// Invert `(a·x² + b·x + c) / (d·x² + e·x + f) = y` for `x`.
-    ///
-    /// Rearranges to `A·x² + B·x + C = 0` with `A = a - y·d`,
-    /// `B = b - y·e`, `C = c - y·f`, solved by the quadratic formula.
-    ///
-    /// The degenerate linear case (`A == 0`) is handled directly, which is
-    /// what makes the reducible `(b·x + c) / f` family invert **exactly** —
-    /// the non-zero-intercept case a scale-only shortcut silently gets wrong.
-    fn invert_rational(&self, physical: f64) -> Result<f64, CalError> {
-        let Coeffs::RatFunc([a, b, c, d, e, f]) = self.method.coeffs else {
-            return Err(CalError::UnsupportedConversion {
-                name: self.method.name.clone(),
-                detail: "a RAT_FUNC method must declare COEFFS a b c d e f",
-            });
-        };
-        let quad_a = a - physical * d;
-        let quad_b = b - physical * e;
-        let quad_c = c - physical * f;
-        if quad_a == 0.0 {
-            if quad_b == 0.0 {
-                return Err(CalError::UnsupportedConversion {
-                    name: self.method.name.clone(),
-                    detail: "the rational function is constant, so it has no inverse",
-                });
-            }
-            return Ok(-quad_c / quad_b);
-        }
-        let discriminant = quad_b * quad_b - 4.0 * quad_a * quad_c;
-        if discriminant < 0.0 {
-            return Err(CalError::UnsupportedConversion {
-                name: self.method.name.clone(),
-                detail: "the physical value lies outside the rational function's range",
-            });
-        }
-        let root = discriminant.sqrt();
-        // Numerically stable quadratic formula: pick the sign that makes the
-        // numerator large, so cancellation does not eat the smaller root.
-        let q = -0.5 * (quad_b + if quad_b >= 0.0 { root } else { -root });
-        let primary = q / quad_a;
-        let secondary = if q != 0.0 { quad_c / q } else { -quad_b / quad_a };
-        // Take the smaller real root: for the monotone rational forms real
-        // ECUs use, that is the branch inside the operating range.
-        match (primary.is_finite(), secondary.is_finite()) {
-            (true, true) => Ok(primary.min(secondary)),
-            (true, false) => Ok(primary),
-            (false, true) => Ok(secondary),
-            (false, false) => Err(CalError::UnsupportedConversion {
-                name: self.method.name.clone(),
-                detail: "the quadratic inverse has no finite root",
-            }),
-        }
-    }
-
-    /// `true` when the rational numerator is at most linear (`a == 0`), the
-    /// reducible form the substrate also recognises.
-    fn rational_numerator_is_affine(&self) -> bool {
-        matches!(self.method.coeffs, Coeffs::RatFunc([0.0, ..]))
     }
 }
 
-/// Round half away from zero, matching `dbc-parse`'s `encode_raw` rule.
-///
-/// `f64::round` rounds half *to even*, which would make a physical value of
-/// exactly 0.5 quantise differently here than it does in the DBC encoder.
-#[must_use]
-pub fn round_half_away(value: f64) -> i64 {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    if value >= 0.0 {
-        let floor = value.floor();
-        let rounded = if value - floor >= 0.5 { floor + 1.0 } else { floor };
-        rounded as i64
-    } else {
-        let ceiling = value.ceil();
-        let rounded = if ceiling - value >= 0.5 { ceiling - 1.0 } else { ceiling };
-        rounded as i64
+/// Range-check a computed raw value against the deposit bounds.
+fn in_range(name: &str, raw: f64, value_min: f64, value_max: f64) -> Result<f64, CalError> {
+    if !raw.is_finite() || raw < value_min || raw > value_max {
+        return Err(CalError::OutOfBounds {
+            name: name.to_string(),
+            value: raw,
+            lower: value_min,
+            upper: value_max,
+        });
     }
+    Ok(raw)
+}
+
+/// Bisection inversion of a conversion that is monotone on the bracket.
+fn bisect(
+    method: &CompuMethod,
+    name: &str,
+    physical: f64,
+    value_min: f64,
+    value_max: f64,
+) -> Result<f64, CalError> {
+    let mut lo = value_min;
+    let mut hi = value_max;
+    let y_lo = method.apply(lo);
+    let y_hi = method.apply(hi);
+    if !y_lo.is_finite() || !y_hi.is_finite() {
+        return Err(CalError::Unsupported {
+            subject: format!("`{name}`"),
+            reason: "rational conversion is not finite at the deposit bounds".to_string(),
+        });
+    }
+    // Bisection needs the target *between* the endpoint values, whichever
+    // way the conversion runs. A descending conversion is searched by
+    // comparing against the reversed endpoint, not by swapping the bracket:
+    // the raw axis stays ascending throughout.
+    let descending = y_lo > y_hi;
+    let low_physical = if descending { y_hi } else { y_lo };
+    let high_physical = if descending { y_lo } else { y_hi };
+    if physical < low_physical || physical > high_physical {
+        return Err(CalError::OutOfBounds {
+            name: name.to_string(),
+            value: physical,
+            lower: low_physical,
+            upper: high_physical,
+        });
+    }
+    for _ in 0..BISECTION_STEPS {
+        let mid = lo.midpoint(hi);
+        if hi - lo <= 1e-9 * mid.abs().max(1.0) {
+            break;
+        }
+        let below = if descending {
+            method.apply(mid) > physical
+        } else {
+            method.apply(mid) < physical
+        };
+        if below {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo.midpoint(hi))
+}
+
+/// Piecewise evaluation of a tabulated conversion; identity when empty.
+fn table_apply(points: &[(f64, f64)], interpolate: bool, raw: f64) -> f64 {
+    let Some(&(first_x, first_y)) = points.first() else {
+        return raw;
+    };
+    if raw <= first_x {
+        return first_y;
+    }
+    let Some(&(last_x, last_y)) = points.last() else {
+        return raw;
+    };
+    if raw >= last_x {
+        return last_y;
+    }
+    // Points are ascending by raw (validated on registration), so the
+    // bracketing segment is found by a single linear scan. The upper end is
+    // half-open so a raw value sitting exactly on a breakpoint takes the
+    // *later* point — which is what a step lookup means, and what makes
+    // interpolation continuous across the breakpoint.
+    for pair in points.windows(2) {
+        let [first, second] = pair else { continue };
+        let (x0, y0) = *first;
+        let (x1, y1) = *second;
+        if raw >= x0 && raw < x1 {
+            if !interpolate {
+                // `TAB_NOINTP` holds the segment's *lower* tabulated value
+                // across the whole segment, switching to the next point at
+                // its own breakpoint — the step the name describes.
+                return y0;
+            }
+            let span = x1 - x0;
+            if span == 0.0 {
+                return y0;
+            }
+            return y0 + (y1 - y0) * (raw - x0) / span;
+        }
+    }
+    first_y
+}
+
+/// Segment-wise inversion of a tabulated conversion.
+fn table_invert(
+    points: &[(f64, f64)],
+    interpolate: bool,
+    name: &str,
+    physical: f64,
+    value_min: f64,
+    value_max: f64,
+) -> Result<f64, CalError> {
+    if points.is_empty() {
+        return Err(CalError::Unsupported {
+            subject: format!("`{name}`"),
+            reason: "TABLE conversion has no points to invert".to_string(),
+        });
+    }
+    let lowest = points
+        .iter()
+        .map(|&(_, phys)| phys)
+        .fold(f64::INFINITY, f64::min);
+    let highest = points
+        .iter()
+        .map(|&(_, phys)| phys)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !physical.is_finite() || physical < lowest || physical > highest {
+        return Err(CalError::OutOfBounds {
+            name: name.to_string(),
+            value: physical,
+            lower: lowest,
+            upper: highest,
+        });
+    }
+    if !interpolate {
+        // The inverse of a step function is the step's own lower breakpoint:
+        // the largest tabulated point whose value is still at or below the
+        // target (the mirror of `table_apply`'s `y0`). `points` is non-empty
+        // here — the early return above guarantees it.
+        let Some(&first) = points.first() else {
+            return Err(CalError::Unsupported {
+                subject: format!("`{name}`"),
+                reason: "TABLE conversion has no points to invert".to_string(),
+            });
+        };
+        let mut best = first;
+        for &point in points {
+            if point.1 <= physical {
+                best = point;
+            }
+        }
+        if physical < best.1 {
+            // Below the first step: clamp to the domain's first point.
+            best = first;
+        }
+        return in_range(name, best.0, value_min, value_max);
+    }
+    // Ascending tables invert segment-wise; a descending or non-monotone
+    // table still resolves, because every bracketing pair is examined and
+    // the one whose round trip is most accurate wins.
+    let mut best_raw: Option<f64> = None;
+    let mut best_error = f64::INFINITY;
+    for pair in points.windows(2) {
+        let [first, second] = pair else { continue };
+        let (x0, y0) = *first;
+        let (x1, y1) = *second;
+        let (low_y, high_y) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
+        if physical < low_y || physical > high_y {
+            continue;
+        }
+        let span = y1 - y0;
+        let raw = if span == 0.0 {
+            x0
+        } else {
+            x0 + (physical - y0) * (x1 - x0) / span
+        };
+        let error = (table_apply(points, interpolate, raw) - physical).abs();
+        if error < best_error {
+            best_error = error;
+            best_raw = Some(raw);
+        }
+    }
+    let Some(raw) = best_raw else {
+        return Err(CalError::OutOfBounds {
+            name: name.to_string(),
+            value: physical,
+            lower: lowest,
+            upper: highest,
+        });
+    };
+    in_range(name, raw, value_min, value_max)
 }

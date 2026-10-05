@@ -1,175 +1,167 @@
-//! A worked example: the two-ECU powertrain description this crate's tests,
-//! documentation, and `powertrain` binary all run against.
+//! The embedded demo project: a realistic two-ECU powertrain description
+//! and the CAN database that binds it.
 //!
-//! Embedding the A2L and DBC text means the examples and doctests cannot
-//! drift from a file on disk, and that `cargo test` needs no fixtures. The
-//! same text is written to `data/powertrain.a2l` for a human to read.
+//! These are the fixtures the crate's own tests, doctests, and the
+//! `calibrate` example run against. They are embedded (`include_str!`) so
+//! every downstream user gets a working example without a data directory,
+//! and they are deliberately *realistic*: vendor `IF_DATA`, `AXIS_DESCR`,
+//! and `COMPU_TAB` blocks the A2L parser must skip, every conversion type,
+//! and limits on every adjustable.
+//!
+//! # `COMPU_TAB` points are registered, not parsed
+//!
+//! The A2L text carries its `COMPU_TAB`/`COMPU_VTAB` blocks for fidelity,
+//! but `a2l_parse` skips them (they are unknown sub-blocks of
+//! `COMPU_METHOD`). [`tables`] holds the same points as data;
+//! [`sample_project`] registers them so the TABLE conversions resolve.
+//!
+//! # Element counts are declared
+//!
+//! `a2l_parse` does not retain the ASAP2 `NUMBER`/`NO_AXIS_PTS` keywords, so
+//! [`element_counts`] carries them for
+//! [`CalibrationProject::declare_elements`](crate::CalibrationProject::declare_elements)
+//! — again, a declaration rather than a guess.
 
-/// The sample A2L description: two modules, sixteen characteristics spanning
-/// all five `CHARACTERISTIC` types, six measurements, and a `COMPU_METHOD`
-/// set covering every conversion type — `LINEAR`, `RAT_FUNC` (both the
-/// reducible-linear and the genuinely quadratic forms), `TABLE` (with
-/// `TAB_INTP` and `TAB_VERB` tabs), and `IDENTITY`.
+/// A realistic two-ECU A2L description: 15 characteristics (including a
+/// `CURVE`, two `MAP`s, a `VAL_BLK`, and an `ASCII` identifier), 5
+/// measurements, and COMPU_METHODs covering every conversion type
+/// (`LINEAR`, `RAT_FUNC` in both its reducible and quadratic forms, `TABLE`
+/// in both interpolated and stepped form, and `IDENTITY`).
 pub const SAMPLE_A2L: &str = include_str!("../data/powertrain.a2l");
 
-/// The sample CAN database, binding the engine and transmission
-/// characteristics to the signals that carry them.
+/// The CAN database that binds [`SAMPLE_A2L`]'s characteristics to message
+/// signals — Intel and Motorola layouts, `UWORD`/`UBYTE` widths.
 pub const SAMPLE_DBC: &str = include_str!("../data/powertrain.dbc");
 
-/// One seed value: the raw count an ECU ships with, for one characteristic.
-struct Seed(&'static str, u64);
-
-/// The engine ECU's shipped calibration page (page 0).
-///
-/// Chosen so every converted value is a round number in its declared unit,
-/// which is what makes a read-modify-write assertion exact rather than
-/// approximate.
-const ENGINE_SEEDS: &[Seed] = &[
-    // 600 counts * 0.1 %/count - 10 % = 50.0 %
-    Seed("eng_load", 600),
-    // (0.5 * 2000 + 100) / 2 = 550 Nm
-    Seed("eng_torque_max", 2000),
-    // 3200 counts * 0.25 rpm/count = 800 rpm
-    Seed("idle_target_rpm", 3200),
-    // 0.0001 * 400^2 + 0.5 * 400 = 216 kPa
-    Seed("boost_target", 400),
-    // identity
-    Seed("rev_limit_cut", 5),
-];
-
-/// The transmission ECU's shipped calibration page (page 1).
-const TRANSMISSION_SEEDS: &[Seed] = &[
-    // 12000 counts * 1e-4 = 1.2
-    Seed("primary_ratio", 12000),
-    // 200 / 4 = 50 kPa
-    Seed("shift_pressure", 200),
-    // 0.5 * 120 - 20 = 40 ms
-    Seed("shift_time_ms", 120),
-    // 0.0005 * 100^2 + 0.2 * 100 = 25 N
-    Seed("clutch_force", 100),
-    // TAB_INTP over gear_pos_tab, input 25 -> 2
-    Seed("gear_code", 25),
-];
-
-/// A seed deposit: a characteristic's raw count, for the mock transport.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SeedValue {
-    /// The module the characteristic lives in.
-    pub module: &'static str,
-    /// The characteristic name.
-    pub name: &'static str,
-    /// The raw count the ECU ships with.
-    pub raw: u64,
-}
-
-/// Every seed value, engine first.
+/// The `COMPU_TAB` points of [`SAMPLE_A2L`], as `(name, points)` pairs.
 #[must_use]
-pub fn seed_values() -> Vec<SeedValue> {
-    ENGINE_SEEDS
-        .iter()
-        .map(|seed| SeedValue {
-            module: "engine",
-            name: seed.0,
-            raw: seed.1,
-        })
-        .chain(TRANSMISSION_SEEDS.iter().map(|seed| SeedValue {
-            module: "transmission",
-            name: seed.0,
-            raw: seed.1,
-        }))
-        .collect()
+pub fn tables() -> Vec<(&'static str, Vec<(f64, f64)>)> {
+    vec![
+        (
+            "boost_curve_tab",
+            vec![
+                (0.0, 0.0),
+                (1000.0, 45.0),
+                (2000.0, 78.0),
+                (3000.0, 105.0),
+                (4000.0, 128.0),
+                (5000.0, 142.0),
+                (6000.0, 150.0),
+            ],
+        ),
+        (
+            "gear_vtab",
+            vec![(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (3.0, 3.0), (4.0, 4.0)],
+        ),
+        (
+            "gear_pos_tab",
+            vec![(0.0, 0.0), (10.0, 1.0), (25.0, 2.0), (45.0, 3.0)],
+        ),
+        (
+            "ratio_vtab",
+            vec![(1.0, 0.0), (2.0, 1.0), (3.0, 2.0), (4.0, 3.0)],
+        ),
+    ]
 }
 
-/// The base address of the engine ECU's calibration page.
-pub const ENGINE_BASE: u32 = 0x0072_0000;
-/// The base address of the transmission ECU's calibration page.
-pub const TRANSMISSION_BASE: u32 = 0x0073_0000;
-/// The page number the engine's calibration lives on.
-pub const ENGINE_PAGE: u32 = 0;
-/// The page number the transmission's calibration lives on.
-pub const TRANSMISSION_PAGE: u32 = 1;
-/// Bytes mapped per page — enough for every characteristic in the module.
-pub const PAGE_LEN: usize = 0x400;
-
-/// A bench transport seeded with [`seed_values`], one page per ECU module.
+/// The ECU memory the demo project starts from: `(address, bytes)` seeds,
+/// one per address the tests and example read before their first write.
 ///
-/// Page 0 carries the engine addresses and page 1 the transmission ones, so
-/// switching pages in a test exercises the same isolation a real
-/// `SET_CAL_PAGE` does.
+/// Addresses come from [`SAMPLE_A2L`]; the values are a plausible factory
+/// calibration (800 rpm idle, 100 Nm torque cap, no boost, rev cut on).
+///
+/// The sample layouts declare `FNC_VALUES 1`, so every characteristic's
+/// deposit record starts with one reserved byte; each seed carries it.
+#[must_use]
+pub fn seed_memory() -> Vec<(u32, Vec<u8>)> {
+    // The leading 0x00 of each characteristic seed is the reserved byte
+    // ahead of `FNC_VALUES POSITION 1`.
+    vec![
+        // engine: eng_load = 400 counts · 0.1 %/count − 10 % = 30.0 %
+        (0x72_01_00, vec![0x00, 0x90, 0x01]),
+        // engine: eng_torque_max = (0.5·200 + 100)/2 = 100 Nm
+        (0x72_01_04, vec![0x00, 0xC8, 0x00]),
+        // engine: idle_target_rpm = 3200 counts · 0.25 rpm = 800 rpm
+        (0x72_01_08, vec![0x00, 0x80, 0x0C]),
+        // engine: boost_target = 0 counts of the quadratic rational = 0 kPa
+        (0x72_01_0C, vec![0x00, 0x00, 0x00]),
+        // engine: rev_limit_cut = 1 (enabled)
+        (0x72_01_10, vec![0x00, 0x01]),
+        // engine: ecu_serial = 'A' (identity raw passthrough)
+        (0x70_01_00, vec![0x00, 0x41]),
+        // engine: boost_curve — 8 elements (UWORD), all 45.0 kPa
+        // (raw 1000 on the boost_tab interpolation)
+        (
+            0x72_10_00,
+            vec![
+                0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8,
+                0x03, 0xE8, 0x03,
+            ],
+        ),
+        // engine: inj_map — 4 elements (UWORD), all 20.0 %
+        // (300 counts · 0.1 − 10)
+        (
+            0x72_20_00,
+            vec![0x00, 0x2C, 0x01, 0x2C, 0x01, 0x2C, 0x01, 0x2C, 0x01],
+        ),
+        // engine: knock_table — 3 elements (UWORD), all 78.0 kPa
+        // (raw 2000 on the boost_tab interpolation)
+        (0x72_30_00, vec![0x00, 0xD0, 0x07, 0xD0, 0x07, 0xD0, 0x07]),
+        // engine measurements (ECU_ADDRESS records, no leading byte)
+        (0x32_00_01, vec![0x00, 0x04]), // engine_speed: 1024 · 0.25 = 256 rpm
+        (0x32_01_00, vec![0x64]),       // coolant_temp: 100 · 0.1 − 10 = 0.0 degC
+        (0x32_02_00, vec![0xC8, 0x00]), // boost_actual: 0.0001·40000 + 100 = 104 kPa
+        // transmission: primary_ratio = 25000 counts · 1e-4 = 2.5
+        (0x73_01_00, vec![0x00, 0xA8, 0x61]),
+        // transmission: shift_pressure = 800 / 4 = 200 kPa
+        (0x73_01_04, vec![0x00, 0x20, 0x03]),
+        // transmission: shift_time_ms = 120 · 0.5 − 20 = 40 ms
+        (0x73_01_08, vec![0x00, 0x78, 0x00]),
+        // transmission: clutch_force = 0.0005·250000 + 0.2·500 = 225 N
+        (0x73_01_0C, vec![0x00, 0xF4, 0x01]),
+        // transmission: gear_code = 2
+        (0x73_01_10, vec![0x00, 0x02]),
+        // transmission: shift_map — 4 elements (UWORD), all 60.0 ms
+        // (160 counts · 0.5 − 20)
+        (
+            0x73_20_00,
+            vec![0x00, 0xA0, 0x00, 0xA0, 0x00, 0xA0, 0x00, 0xA0, 0x00],
+        ),
+        // transmission measurements
+        (0x33_00_01, vec![0x10, 0x27]), // turb_speed: 10000 · 1e-4 = 1.0
+        (0x33_01_00, vec![0x64, 0x00]), // out_speed: 100 (identity)
+    ]
+}
+
+/// The element counts of the sample project's multi-element
+/// characteristics — the `NUMBER`/`NO_AXIS_PTS` declarations that
+/// `a2l_parse` does not retain.
+#[must_use]
+pub fn element_counts() -> Vec<(&'static str, &'static str, usize)> {
+    vec![
+        ("engine", "boost_curve", 8),
+        ("engine", "inj_map", 4),
+        ("engine", "knock_table", 3),
+        ("transmission", "shift_map", 4),
+    ]
+}
+
+/// Build the demo project: [`SAMPLE_A2L`] parsed, its tables registered, and
+/// its element counts declared.
 ///
 /// # Errors
 ///
-/// [`CalError::UnknownModule`] or [`CalError::UnknownCharacteristic`] when a
-/// seed names something the description does not declare — a fixture that
-/// has drifted out of sync with its A2L, which must fail loudly.
-///
-/// # Panics
-///
-/// Never: every path returns a typed error.
-pub fn seeded_transport(
-    project: &crate::CalibrationProject,
-) -> Result<crate::MockTransport, crate::CalError> {
-    let mut transport = crate::MockTransport::empty();
-    transport.insert_page(
-        ENGINE_PAGE,
-        crate::mock::MemoryPage::new(ENGINE_BASE, PAGE_LEN),
-    );
-    transport.insert_page(
-        TRANSMISSION_PAGE,
-        crate::mock::MemoryPage::new(TRANSMISSION_BASE, PAGE_LEN),
-    );
-    for seed in seed_values() {
-        let characteristic = project.characteristic(seed.module, seed.name)?;
-        let size = characteristic.deposit_size().unwrap_or(2);
-        let offset = usize::try_from(characteristic.address - page_base(seed.module))
-            .map_err(|_| crate::CalError::Transport("seed address underflow".to_owned()))?;
-        let page = if seed.module == "engine" {
-            ENGINE_PAGE
-        } else {
-            TRANSMISSION_PAGE
-        };
-        let bytes = to_little_endian(seed.raw, size);
-        transport.select_page(page);
-        transport.write(characteristic.address, &bytes)?;
-        let _ = offset;
+/// [`CalError::A2l`](crate::CalError::A2l) or
+/// [`CalError::Unsupported`](crate::CalError::Unsupported) only if the
+/// embedded fixtures are themselves malformed — a bug this crate's own tests
+/// would catch first.
+pub fn sample_project() -> Result<crate::CalibrationProject, crate::CalError> {
+    let mut project = crate::CalibrationProject::from_a2l(SAMPLE_A2L)?;
+    for (name, points) in tables() {
+        project.register_table(name, points)?;
     }
-    transport.select_page(ENGINE_PAGE);
-    Ok(transport)
-}
-
-/// The base address of a module's calibration page.
-#[must_use]
-pub fn page_base(module: &str) -> u32 {
-    if module == "transmission" {
-        TRANSMISSION_BASE
-    } else {
-        ENGINE_BASE
+    for (module, name, elements) in element_counts() {
+        project.declare_elements(module, name, elements)?;
     }
-}
-
-/// The page number a module's calibration lives on.
-#[must_use]
-pub fn page_of(module: &str) -> u32 {
-    if module == "transmission" {
-        TRANSMISSION_PAGE
-    } else {
-        ENGINE_PAGE
-    }
-}
-
-/// A raw count as a little-endian buffer of `size` bytes.
-fn to_little_endian(value: u64, size: usize) -> Vec<u8> {
-    (0..size)
-        .map(|index| {
-            if index >= 8 {
-                return 0;
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let shift = 8 * u32::try_from(index).unwrap_or(0);
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                (value >> shift) as u8
-            }
-        })
-        .collect()
+    Ok(project)
 }

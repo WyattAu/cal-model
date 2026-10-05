@@ -1,20 +1,283 @@
-//! The calibration data model: modules, characteristics, measurements, and
-//! the CAN signal bindings a DBC database attaches to them.
+//! The resolved calibration model: modules, characteristics, measurements.
 //!
-//! Every type here is a *resolved* view of an [`a2l_parse`] declaration —
-//! the COMPU_METHOD a CHARACTERISTIC references has already been turned
-//! into a [`CompuMethod`], and the RECORD_LAYOUT it deposits through has
-//! already yielded a datatype and a byte offset. Nothing in this module
-//! parses; it is the vocabulary [`CalibrationProject`](crate::CalibrationProject),
-//! [`CalibrationSession`](crate::CalibrationSession), and
-//! [`calibrate_curve`](crate::calibrate_curve) speak.
+//! [`a2l_parse`] hands back a *declaration* graph in which every
+//! conversion is still an unresolvable string reference. The types here are
+//! the *resolved* view a calibration engineer actually drives: the
+//! `COMPU_METHOD` has been looked up and attached to its characteristic, the
+//! deposit datatype is known, and the A2L type keyword is presented as
+//! [`CharKind`].
+//!
+//! Resolution happens once, at [`CalibrationProject`](crate::CalibrationProject)
+//! construction, so every later access is a field read rather than a search.
+
+use a2l_parse::{CharType, Characteristic as A2lCharacteristic, DataType};
 
 use crate::conversion::CompuMethod;
-use a2l_parse::{CharType, DataType};
+use crate::error::CalError;
 
-/// The ASAP2 CHARACTERISTIC type keywords, as the calibration layer
-/// consumes them.
+/// One ECU's calibration surface.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Module {
+    /// MODULE name — the key every lookup takes.
+    pub name: String,
+    /// CHARACTERISTIC blocks: the adjustable parameters, in file order.
+    pub characteristics: Vec<Characteristic>,
+    /// MEASUREMENT blocks: the ECU-internal quantities, in file order.
+    pub measurements: Vec<Measurement>,
+}
+
+impl Module {
+    /// Resolve every reference in `module`, attaching each characteristic's
+    /// `COMPU_METHOD` and deposit datatype.
+    ///
+    /// # Errors
+    ///
+    /// [`CalError::UnknownCompuMethod`] when a `COMPU_METHOD` reference is
+    /// not declared in the same module — A2L scopes method names per module,
+    /// so a missing declaration is a real defect, not a lookup miss.
+    pub(crate) fn resolve(
+        module: &a2l_parse::A2lModule,
+        tables: &crate::tables::TableSet,
+    ) -> Result<Self, CalError> {
+        let mut characteristics = Vec::with_capacity(module.characteristics.len());
+        for raw in &module.characteristics {
+            characteristics.push(Characteristic::resolve(raw, module, tables)?);
+        }
+        let mut measurements = Vec::with_capacity(module.measurements.len());
+        for raw in &module.measurements {
+            measurements.push(Measurement::resolve(raw, module, tables)?);
+        }
+        Ok(Self {
+            name: module.name.clone(),
+            characteristics,
+            measurements,
+        })
+    }
+
+    /// The CHARACTERISTIC named `name`.
+    #[must_use]
+    pub fn characteristic(&self, name: &str) -> Option<&Characteristic> {
+        self.characteristics.iter().find(|c| c.name == name)
+    }
+
+    /// The MEASUREMENT named `name`.
+    #[must_use]
+    pub fn measurement(&self, name: &str) -> Option<&Measurement> {
+        self.measurements.iter().find(|m| m.name == name)
+    }
+}
+
+/// A CHARACTERISTIC: one adjustable calibration parameter, fully resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Characteristic {
+    /// CHARACTERISTIC name.
+    pub name: String,
+    /// ECU address of the parameter's deposit.
+    pub address: u32,
+    /// RECORD_LAYOUT reference (the deposit's memory layout).
+    pub deposit: String,
+    /// Calibration value type.
+    pub kind: CharKind,
+    /// The resolved `COMPU_METHOD` for this parameter.
+    pub conversion: CompuMethod,
+    /// Declared lower limit, on the **physical** scale.
+    pub lower_limit: f64,
+    /// Declared upper limit, on the **physical** scale.
+    pub upper_limit: f64,
+    /// Maximum difference between two adjustment steps (physical units).
+    pub max_diff: f64,
+    /// The deposit element datatype, resolved from the `RECORD_LAYOUT`'s
+    /// `FNC_VALUES` clause.
+    ///
+    /// `None` when the record layout is undeclared or carries no
+    /// `FNC_VALUES` — legal for a `CURVE`/`MAP`/`VAL_BLK` block, and the
+    /// signal that this characteristic's byte length is not derivable from
+    /// the description.
+    pub datatype: Option<DataType>,
+}
+
+impl Characteristic {
+    /// Resolve one A2L CHARACTERISTIC against its module's declarations.
+    ///
+    /// # Errors
+    ///
+    /// [`CalError::UnknownCompuMethod`] if the conversion reference is
+    /// undeclared.
+    pub(crate) fn resolve(
+        raw: &A2lCharacteristic,
+        module: &a2l_parse::A2lModule,
+        tables: &crate::tables::TableSet,
+    ) -> Result<Self, CalError> {
+        let method = module
+            .compu_method_by_name(&raw.conversion)
+            .ok_or_else(|| CalError::UnknownCompuMethod(raw.conversion.clone()))?;
+        let datatype = module
+            .record_layout_by_name(&raw.deposit)
+            .and_then(|layout| layout.fnc_values)
+            .map(|fnc| fnc.datatype);
+        Ok(Self {
+            name: raw.name.clone(),
+            address: raw.address,
+            deposit: raw.deposit.clone(),
+            kind: CharKind::from(raw.r#type),
+            conversion: CompuMethod::new(method.clone(), tables),
+            lower_limit: raw.lower_limit,
+            upper_limit: raw.upper_limit,
+            max_diff: raw.max_diff,
+            datatype,
+        })
+    }
+
+    /// Interpret the raw memory bit pattern on the physical scale.
+    ///
+    /// Sign-extends for the signed ASAP2 datatypes, so a `SBYTE` holding
+    /// `0xFF` converts as −1, not 255.
+    #[must_use]
+    pub fn to_physical(&self, raw: u64) -> f64 {
+        self.conversion
+            .to_physical(self.signed_value(raw) as f64)
+    }
+
+    /// The signed count a raw bit pattern denotes.
+    ///
+    /// With no resolved datatype the pattern is taken as unsigned, which is
+    /// the only reading a bare block deposit supports.
+    #[must_use]
+    pub fn signed_value(&self, raw: u64) -> i64 {
+        let Some(datatype) = self.datatype else {
+            return raw.min(i64::MAX as u64) as i64;
+        };
+        let width = u32::try_from(datatype.size_bytes() * 8).unwrap_or(64).min(64);
+        if !is_signed_datatype(datatype) {
+            return raw.min(i64::MAX as u64) as i64;
+        }
+        // Sign-extend from `width` bits: shift out the sign, shift back in.
+        let shift = 64 - width;
+        ((raw << shift) as i64) >> shift
+    }
+
+    /// The deposit element width in bits, or `None` when the datatype is
+    /// unresolved or the characteristic deposits a block.
+    #[must_use]
+    pub fn deposit_width(&self) -> Option<u32> {
+        match self.datatype {
+            Some(datatype) if !self.kind.is_block() => {
+                Some(u32::try_from(datatype.size_bytes() * 8).unwrap_or(64))
+            }
+            _ => None,
+        }
+    }
+
+    /// The deposit element size in bytes, or `None` when the datatype is
+    /// unresolved. For a block deposit this is the size of *one element*.
+    #[must_use]
+    pub fn deposit_size(&self) -> Option<usize> {
+        self.datatype.map(DataType::size_bytes)
+    }
+
+    /// The raw count range this characteristic's deposit can hold, as
+    /// `(min, max)` on the signed scale.
+    ///
+    /// `None` when the datatype is unresolved.
+    #[must_use]
+    pub fn raw_range(&self) -> Option<(f64, f64)> {
+        self.datatype.map(raw_range)
+    }
+}
+
+/// A MEASUREMENT: one ECU-internal quantity available for measurement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Measurement {
+    /// MEASUREMENT name.
+    pub name: String,
+    /// ECU address of the raw value, `0` when the A2L declares none.
+    pub address: u32,
+    /// The resolved `COMPU_METHOD`.
+    pub conversion: CompuMethod,
+    /// The ASAP2 datatype of the raw value in ECU memory.
+    pub datatype: DataType,
+}
+
+impl Measurement {
+    /// Resolve one A2L MEASUREMENT against its module's declarations.
+    ///
+    /// # Errors
+    ///
+    /// [`CalError::UnknownCompuMethod`] if the conversion reference is
+    /// undeclared.
+    pub(crate) fn resolve(
+        raw: &a2l_parse::Measurement,
+        module: &a2l_parse::A2lModule,
+        tables: &crate::tables::TableSet,
+    ) -> Result<Self, CalError> {
+        let method = module
+            .compu_method_by_name(&raw.conversion)
+            .ok_or_else(|| CalError::UnknownCompuMethod(raw.conversion.clone()))?;
+        Ok(Self {
+            name: raw.name.clone(),
+            address: raw.address,
+            conversion: CompuMethod::new(method.clone(), tables),
+            datatype: raw.datatype,
+        })
+    }
+
+    /// Size of the raw value in ECU memory, in bytes.
+    #[must_use]
+    pub fn size_bytes(&self) -> usize {
+        self.datatype.size_bytes()
+    }
+
+    /// Interpret the raw memory bit pattern on the physical scale,
+    /// sign-extending for the signed ASAP2 datatypes.
+    #[must_use]
+    pub fn to_physical(&self, raw: u64) -> f64 {
+        let width = u32::try_from(self.datatype.size_bytes() * 8).unwrap_or(64);
+        let shift = 64 - width.min(64);
+        let signed = is_signed_datatype(self.datatype);
+        let value = if signed {
+            ((raw << shift) as i64) >> shift
+        } else {
+            raw.min(i64::MAX as u64) as i64
+        };
+        self.conversion.to_physical(value as f64)
+    }
+
+    /// The physical raw span this datatype can hold, as `(min, max)`.
+    #[must_use]
+    pub fn raw_range(&self) -> (f64, f64) {
+        raw_range(self.datatype)
+    }
+}
+
+/// Whether an ASAP2 datatype is two's-complement signed.
+#[must_use]
+pub fn is_signed_datatype(datatype: DataType) -> bool {
+    matches!(
+        datatype,
+        DataType::Sbyte | DataType::Sword | DataType::Slong | DataType::Int64
+    )
+}
+
+/// The raw count range a datatype's bit pattern can denote, as `(min, max)`
+/// on the **signed** scale — negative for the signed types.
+///
+/// This is the bracket [`CalibrationProject::to_raw`] checks against: it is
+/// what the deposit physically holds, independent of any conversion.
+#[must_use]
+pub fn raw_range(datatype: DataType) -> (f64, f64) {
+    let bits = u32::try_from(datatype.size_bytes() * 8).unwrap_or(64);
+    if is_signed_datatype(datatype) {
+        let half = 2f64.powi(i32::try_from(bits - 1).unwrap_or(31));
+        (-half, half - 1.0)
+    } else {
+        let top = 2f64.powi(i32::try_from(bits).unwrap_or(64));
+        (0.0, top - 1.0)
+    }
+}
+
+/// The A2L CHARACTERISTIC type keywords, as presented by this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::exhaustive_enums)]
 pub enum CharKind {
     /// `VALUE` — a single scalar.
     Value,
@@ -29,9 +292,9 @@ pub enum CharKind {
 }
 
 impl CharKind {
-    /// Re-tag an [`a2l_parse::CharType`] for the calibration layer.
+    /// Map an A2L `CharType` onto this crate's kind enum.
     #[must_use]
-    pub const fn from_char_type(kind: CharType) -> Self {
+    pub const fn from(kind: CharType) -> Self {
         match kind {
             CharType::Value => Self::Value,
             CharType::Curve => Self::Curve,
@@ -41,7 +304,7 @@ impl CharKind {
         }
     }
 
-    /// The keyword this kind came from.
+    /// The ASAP2 keyword.
     #[must_use]
     pub const fn keyword(self) -> &'static str {
         match self {
@@ -53,270 +316,19 @@ impl CharKind {
         }
     }
 
-    /// `true` when the characteristic is an array of values rather than a
-    /// single scalar.
+    /// `true` for the kinds that deposit a *block* of elements rather than
+    /// one scalar.
+    ///
+    /// A block deposit has no single element width, so its byte length comes
+    /// from the axis point counts rather than the record layout's datatype.
     #[must_use]
-    pub const fn is_multi_element(self) -> bool {
+    pub const fn is_block(self) -> bool {
         matches!(self, Self::Curve | Self::Map | Self::ValBlk)
     }
 }
 
-/// A CHARACTERISTIC: one calibration parameter, resolved and ready to read,
-/// write, and validate.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Characteristic {
-    /// CHARACTERISTIC name.
-    pub name: String,
-    /// `VALUE`/`CURVE`/`MAP`/`VAL_BLK`/`ASCII`.
-    pub kind: CharKind,
-    /// ECU address of the deposit's first byte.
-    pub address: u32,
-    /// RECORD_LAYOUT the values deposit through.
-    pub deposit: String,
-    /// Byte offset of the value array inside the deposit record
-    /// (`FNC_VALUES POSITION`).
-    pub deposit_position: u8,
-    /// Element datatype, from the deposit's `FNC_VALUES DATATYPE`.
-    pub datatype: DataType,
-    /// Number of elements in the deposit. `a2l_parse` does not retain the
-    /// ASAP2 `NUMBER` keyword, so this is `1` until declared with
-    /// [`CalibrationProject::declare_elements`](crate::CalibrationProject::declare_elements)
-    /// — see that method's documentation for why it is an explicit
-    /// declaration rather than a guess.
-    pub elements: usize,
-    /// The resolved conversion.
-    pub conversion: CompuMethod,
-    /// `LOWER_LIMIT` — physical.
-    pub lower_limit: f64,
-    /// `UPPER_LIMIT` — physical.
-    pub upper_limit: f64,
-    /// `MAX_DIFF` — the largest step a single adjustment may take.
-    pub max_diff: f64,
-}
-
-impl Characteristic {
-    /// Element width in bits.
-    #[must_use]
-    pub fn element_bits(&self) -> u32 {
-        // size_bytes() is 1..=8 for every DataType, so the widening is
-        // lossless and always in range for a u32.
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            (self.datatype.size_bytes() * 8) as u32
-        }
-    }
-
-    /// `true` when the deposit datatype is two's-complement signed.
-    #[must_use]
-    pub const fn is_signed(&self) -> bool {
-        matches!(
-            self.datatype,
-            DataType::Sbyte | DataType::Sword | DataType::Slong | DataType::Int64
-        )
-    }
-
-    /// Bit mask covering one element's bits.
-    #[must_use]
-    pub fn element_mask(&self) -> u64 {
-        let bits = self.element_bits();
-        if bits >= 64 {
-            u64::MAX
-        } else {
-            (1_u64 << bits) - 1
-        }
-    }
-
-    /// Total deposit size in bytes (all elements).
-    #[must_use]
-    pub fn size_bytes(&self) -> usize {
-        self.elements * self.datatype.size_bytes()
-    }
-
-    /// Interpret a raw *bit pattern* as the numeric value the conversion
-    /// sees: signed datatypes are sign-extended, unsigned ones masked.
-    #[must_use]
-    pub fn raw_value(&self, raw: u64) -> f64 {
-        let masked = raw & self.element_mask();
-        if self.is_signed() {
-            sign_extend(masked, self.element_bits()) as f64
-        } else {
-            #[allow(clippy::cast_precision_loss)]
-            {
-                masked as f64
-            }
-        }
-    }
-
-    /// Encode a numeric raw value back into its memory bit pattern.
-    #[must_use]
-    pub fn raw_bits(&self, value: f64) -> u64 {
-        if self.is_signed() {
-            #[allow(clippy::cast_possible_wrap)]
-            let as_int = value as i64;
-            #[allow(clippy::cast_sign_loss)]
-            let bits = as_int as u64 & self.element_mask();
-            bits
-        } else {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let bits = value as u64 & self.element_mask();
-            bits
-        }
-    }
-
-    /// The raw-value bounds of the deposit, in *numeric* terms (negative
-    /// for signed datatypes).
-    #[must_use]
-    pub fn value_bounds(&self) -> (f64, f64) {
-        let bits = self.element_bits();
-        if self.is_signed() {
-            let half = 2_f64.powi(i32::try_from(bits - 1).unwrap_or(31));
-            (-half, half - 1.0)
-        } else if bits >= 64 {
-            #[allow(clippy::cast_precision_loss)]
-            {
-                (0.0, u64::MAX as f64)
-            }
-        } else {
-            let span = 2_f64.powi(i32::try_from(bits).unwrap_or(32));
-            (0.0, span - 1.0)
-        }
-    }
-
-    /// `true` when the A2L declaration constrains the physical value at
-    /// all. A degenerate range (`lower >= upper`, as generators emit for
-    /// ASCII identifiers) imposes no constraint — the same convention
-    /// `dbc-parse` applies to an empty `[min|max]`.
-    #[must_use]
-    pub fn has_limits(&self) -> bool {
-        self.lower_limit.is_finite()
-            && self.upper_limit.is_finite()
-            && self.lower_limit < self.upper_limit
-    }
-
-    /// `true` when `physical` is inside the declared limits (or no limits
-    /// are declared).
-    #[must_use]
-    pub fn within_limits(&self, physical: f64) -> bool {
-        if !physical.is_finite() {
-            return false;
-        }
-        if !self.has_limits() {
-            return true;
-        }
-        physical >= self.lower_limit && physical <= self.upper_limit
-    }
-
-    /// Return a copy with the element count set (the builder form of
-    /// [`CalibrationProject::declare_elements`](crate::CalibrationProject::declare_elements)).
-    #[must_use]
-    pub fn with_elements(mut self, elements: usize) -> Self {
-        self.elements = elements;
-        self
-    }
-}
-
-/// A MEASUREMENT: an ECU-internal quantity, resolved for measurement.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Measurement {
-    /// MEASUREMENT name.
-    pub name: String,
-    /// `ECU_ADDRESS` (`0` when the declaration omitted it).
-    pub address: u32,
-    /// The resolved conversion.
-    pub conversion: CompuMethod,
-    /// Raw datatype in ECU memory.
-    pub datatype: DataType,
-}
-
-impl Measurement {
-    /// Element width in bytes.
-    #[must_use]
-    pub fn size_bytes(&self) -> usize {
-        self.datatype.size_bytes()
-    }
-
-    /// `true` when the datatype is two's-complement signed.
-    #[must_use]
-    pub const fn is_signed(&self) -> bool {
-        matches!(
-            self.datatype,
-            DataType::Sbyte | DataType::Sword | DataType::Slong | DataType::Int64
-        )
-    }
-
-    /// Interpret a raw bit pattern as the numeric value the conversion
-    /// sees.
-    #[must_use]
-    pub fn raw_value(&self, raw: u64) -> f64 {
-        let bits = u32::try_from(self.datatype.size_bytes() * 8).unwrap_or(32);
-        let mask = if bits >= 64 {
-            u64::MAX
-        } else {
-            (1_u64 << bits) - 1
-        };
-        let masked = raw & mask;
-        if self.is_signed() {
-            sign_extend(masked, bits) as f64
-        } else {
-            #[allow(clippy::cast_precision_loss)]
-            {
-                masked as f64
-            }
-        }
-    }
-}
-
-/// One `/begin MODULE` resolved into the calibration vocabulary.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Module {
-    /// MODULE name.
-    pub name: String,
-    /// Characteristics, in declaration order.
-    pub characteristics: Vec<Characteristic>,
-    /// Measurements, in declaration order.
-    pub measurements: Vec<Measurement>,
-}
-
-impl Module {
-    /// The CHARACTERISTIC named `name`.
-    #[must_use]
-    pub fn characteristic(&self, name: &str) -> Option<&Characteristic> {
-        self.characteristics.iter().find(|c| c.name == name)
-    }
-
-    /// The MEASUREMENT named `name`.
-    #[must_use]
-    pub fn measurement(&self, name: &str) -> Option<&Measurement> {
-        self.measurements.iter().find(|m| m.name == name)
-    }
-
-    /// Characteristic names, in declaration order.
-    pub fn characteristic_names(&self) -> impl Iterator<Item = &str> {
-        self.characteristics.iter().map(|c| c.name.as_str())
-    }
-
-    /// Measurement names, in declaration order.
-    pub fn measurement_names(&self) -> impl Iterator<Item = &str> {
-        self.measurements.iter().map(|m| m.name.as_str())
-    }
-}
-
-/// Sign-extend the low `bits` bits of `raw` to an `i64`.
-fn sign_extend(raw: u64, bits: u32) -> i64 {
-    if bits == 0 || bits >= 64 {
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            return raw as i64;
-        }
-    }
-    let sign_bit = 1_u64 << (bits - 1);
-    #[allow(clippy::cast_possible_wrap)]
-    if raw & sign_bit != 0 {
-        (raw | (u64::MAX << bits)) as i64
-    } else {
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            raw as i64
-        }
+impl From<CharType> for CharKind {
+    fn from(kind: CharType) -> Self {
+        Self::from(kind)
     }
 }

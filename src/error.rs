@@ -81,6 +81,24 @@ pub enum CalError {
     #[error("unknown or unusable COMPU_TAB `{0}`")]
     UnknownComputationTable(String),
 
+    /// The description text has a `/begin BLOCK` with no matching `/end`.
+    #[error("unterminated A2L block `{0}`")]
+    UnterminatedA2lBlock(String),
+
+    /// The description text is not valid ASAP2 at the point this crate had
+    /// to read it, with the reason.
+    #[error("malformed A2L: {0}")]
+    MalformedA2l(String),
+
+    /// A `/begin X` block is closed by `/end Y`.
+    #[error("A2L block mismatch: `{opened}` closed by `{closed}`")]
+    MismatchedA2lBlock {
+        /// Block keyword that was opened.
+        opened: String,
+        /// Block keyword that closed it instead.
+        closed: String,
+    },
+
     /// The value violates the declared CHARACTERISTIC limits.
     #[error("characteristic `{name}` value {value} outside declared limits [{lower}, {upper}]")]
     LimitViolation {
@@ -186,6 +204,7 @@ impl CalError {
             | Self::UnknownMeasurement(name)
             | Self::UnknownCompuMethod(name)
             | Self::UnknownComputationTable(name)
+            | Self::UnterminatedA2lBlock(name)
             | Self::UnsupportedConversion { name, .. }
             | Self::InfeasibleCurve { name }
             | Self::AmbiguousSignal { name, .. } => name.as_str(),
@@ -196,6 +215,8 @@ impl CalError {
             | Self::UnknownModule(_)
             | Self::Transport(_)
             | Self::Convergence { .. }
+            | Self::MalformedA2l(_)
+            | Self::MismatchedA2lBlock { .. }
             | Self::NoParameters => return None,
         })
     }

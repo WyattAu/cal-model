@@ -1,6 +1,27 @@
+
 # cargo-vet audits file
 
+[[audits.a2l-parse]]
+criteria = "safe-to-deploy"
+version = "0.1.0"
+notes = "WyattAu first-party crate; reviewed as the original in-tree implementation."
+
 [[audits.cal-model]]
+criteria = "safe-to-deploy"
+version = "0.1.0"
+notes = "WyattAu first-party crate; reviewed as the original in-tree implementation."
+
+[[audits.can-core]]
+criteria = "safe-to-deploy"
+version = "0.1.0"
+notes = "WyattAu first-party crate; reviewed as the original in-tree implementation."
+
+[[audits.dbc-parse]]
+criteria = "safe-to-deploy"
+version = "0.1.0"
+notes = "WyattAu first-party crate; reviewed as the original in-tree implementation."
+
+[[audits.xcp-core]]
 criteria = "safe-to-deploy"
 version = "0.1.0"
 notes = "WyattAu first-party crate; reviewed as the original in-tree implementation."

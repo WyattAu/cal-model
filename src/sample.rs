@@ -146,8 +146,34 @@ pub fn element_counts() -> Vec<(&'static str, &'static str, usize)> {
     ]
 }
 
-/// Build the demo project: [`SAMPLE_A2L`] parsed, its tables registered, and
-/// its element counts declared.
+/// Register [`tables`] and declare [`element_counts`] on an already-parsed
+/// project.
+///
+/// Every caller that loads [`SAMPLE_A2L`] — or a file with the same
+/// declarations — needs both: `a2l_parse` skips the `COMPU_TAB` blocks and
+/// does not retain `NUMBER`/`NO_AXIS_PTS`, so neither the tabulation points
+/// nor a curve's element count arrive with the parse. A host that has its own
+/// source for either (an exporter, a `.ara` companion file) should call
+/// [`register_table`](crate::CalibrationProject::register_table) and
+/// [`declare_elements`](crate::CalibrationProject::declare_elements)
+/// directly instead.
+///
+/// # Errors
+///
+/// [`CalError::Unsupported`](crate::CalError::Unsupported) when a named
+/// characteristic or module is absent, or a table's points are not ascending.
+pub fn complete(project: &mut crate::CalibrationProject) -> Result<(), crate::CalError> {
+    for (name, points) in tables() {
+        project.register_table(name, points)?;
+    }
+    for (module, name, elements) in element_counts() {
+        project.declare_elements(module, name, elements)?;
+    }
+    Ok(())
+}
+
+/// Build the demo project: [`SAMPLE_A2L`] parsed, completed by
+/// [`complete`].
 ///
 /// # Errors
 ///
@@ -157,11 +183,6 @@ pub fn element_counts() -> Vec<(&'static str, &'static str, usize)> {
 /// would catch first.
 pub fn sample_project() -> Result<crate::CalibrationProject, crate::CalError> {
     let mut project = crate::CalibrationProject::from_a2l(SAMPLE_A2L)?;
-    for (name, points) in tables() {
-        project.register_table(name, points)?;
-    }
-    for (module, name, elements) in element_counts() {
-        project.declare_elements(module, name, elements)?;
-    }
+    complete(&mut project)?;
     Ok(project)
 }

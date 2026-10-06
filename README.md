@@ -122,7 +122,7 @@ cargo run --example calibrate -- data/powertrain.a2l data/powertrain.dbc
 
 ## Tests
 
-`cargo test` runs 157 tests across seven suites plus two doctests:
+`cargo test` runs 167 tests across seven suites plus two doctests:
 
 | Suite | Covers |
 |---|---|
@@ -131,6 +131,7 @@ cargo run --example calibrate -- data/powertrain.a2l data/powertrain.dbc
 | `session` | read-modify-write against the mock, read-back verification, page isolation, snapshot/restore bit-exactness, diff reports, hand-computed byte-order extraction, transport error propagation |
 | `calibrate` | monotone fits recovering synthetic data, non-monotone rejection, bounded 2-D optimisation, convergence reporting |
 | `errors` | `Display` for every `CalError` variant, each variant reached from the public API, the `Error` / `source()` contract |
+| `model` | every ASAP2 datatype and characteristic kind, signed bit-pattern handling, datatype-derived bounds, and the resolved model's accessors |
 | `properties` | 500-case linear round-trip, 200-case snapshot/restore idempotence, 300-case byte-order extraction against an independently written naive bit-walk, plus curve and error-rendering properties |
 
 `cargo fuzz run cal_parse` covers the calibration layer over arbitrary input

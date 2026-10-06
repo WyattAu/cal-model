@@ -4,24 +4,19 @@
 [[audits.a2l-parse]]
 criteria = "safe-to-deploy"
 version = "0.1.0"
-notes = "WyattAu first-party crate; reviewed as the original in-tree implementation."
-
-[[audits.cal-model]]
-criteria = "safe-to-deploy"
-version = "0.1.0"
-notes = "WyattAu first-party crate; reviewed as the original in-tree implementation."
+notes = "WyattAu first-party crate (L1); the ASAP2 parser this layer resolves."
 
 [[audits.can-core]]
 criteria = "safe-to-deploy"
 version = "0.1.0"
-notes = "WyattAu first-party crate; reviewed as the original in-tree implementation."
+notes = "WyattAu first-party crate (L0); reached transitively through xcp-core."
 
 [[audits.dbc-parse]]
 criteria = "safe-to-deploy"
 version = "0.1.0"
-notes = "WyattAu first-party crate; reviewed as the original in-tree implementation."
+notes = "WyattAu first-party crate (L0); the DBC parser supplying signal layouts."
 
 [[audits.xcp-core]]
 criteria = "safe-to-deploy"
 version = "0.1.0"
-notes = "WyattAu first-party crate; reviewed as the original in-tree implementation."
+notes = "WyattAu first-party crate (L1); the XCP framing this layer builds on."

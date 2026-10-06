@@ -163,5 +163,12 @@ pub fn sample_project() -> Result<crate::CalibrationProject, crate::CalError> {
     for (module, name, elements) in element_counts() {
         project.declare_elements(module, name, elements)?;
     }
+    // Attach the DBC too. Without this the fixture parsed the A2L side and left
+    // every signal unbound, so `signal_bindings` was empty for every module and
+    // the "A2L + DBC → calibration session" path the crate exists for was never
+    // exercised by the thing a consumer reaches for first. Found by the
+    // estate-integration `round16_debt` suite, which binds nothing and gets
+    // nothing.
+    project.attach_dbc(dbc_parse::Dbc::parse(SAMPLE_DBC)?)?;
     Ok(project)
 }

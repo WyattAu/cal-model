@@ -1043,7 +1043,11 @@ fn binding_falls_back_to_a_case_insensitive_signal_match() {
 
 #[test]
 fn a_project_without_a_dbc_reports_no_binding() {
-    let project = sample_project().unwrap();
+    // Built from SAMPLE_A2L directly rather than via `sample_project`, which now
+    // attaches the DBC — a project *with* no bus attached is the point here, and
+    // relying on a fixture being incomplete to express that is how the fixture
+    // ended up incomplete in the first place.
+    let project = CalibrationProject::from_a2l(cal_model::SAMPLE_A2L).unwrap();
     assert!(project.dbc().is_none());
     assert!(project
         .signal_for_characteristic("engine", "eng_load")
@@ -1133,7 +1137,9 @@ fn an_out_of_range_signal_layout_is_refused_and_leaves_no_dbc() {
         ..cal_model::dbc::Dbc::default()
     };
 
-    let mut project = sample_project().unwrap();
+    // From SAMPLE_A2L directly, so the assertion that a *refused* attachment
+    // leaves no DBC starts from a project that had none.
+    let mut project = CalibrationProject::from_a2l(cal_model::SAMPLE_A2L).unwrap();
     let error = project.attach_dbc(dbc).unwrap_err();
     assert!(
         matches!(&error, CalError::Unsupported { subject, reason }

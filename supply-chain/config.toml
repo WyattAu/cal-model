@@ -193,5 +193,5 @@ criteria = "safe-to-run"
 version = "0.8.60"
 criteria = "safe-to-deploy"
 
-[policy]
+[policy.cal-model]
 audit-as-crates-io = true

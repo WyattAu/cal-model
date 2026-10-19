@@ -26,7 +26,7 @@ url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
 url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/audits.toml"
 
 [policy.cal-model]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [[exemptions.autocfg]]
 version = "1.5.1"

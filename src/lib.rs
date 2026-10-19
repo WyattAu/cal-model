@@ -128,7 +128,9 @@ pub use dbc_parse::ByteOrder;
 pub use error::CalError;
 pub use model::{CharKind, Characteristic, Measurement, Module};
 pub use project::CalibrationProject;
-pub use sample::{element_counts, sample_project, seed_memory, tables, SAMPLE_A2L, SAMPLE_DBC};
+pub use sample::{
+    complete, element_counts, sample_project, seed_memory, tables, SAMPLE_A2L, SAMPLE_DBC,
+};
 pub use session::{
     diff_snapshots, render_deltas, CalibrationDelta, CalibrationSession, Snapshot, SnapshotEntry,
     SnapshotValue, XcpTransport,

@@ -66,10 +66,14 @@ writing a value the ECU would latch as something else.
 writes, then reads back and fails if the ECU did not latch it. A tool that
 reports a write it cannot confirm is worse than one that reports an error.
 
-**Element counts are declared, not guessed.** `a2l_parse` does not retain
-the ASAP2 `NUMBER` / `NO_AXIS_PTS` keywords, so a curve's element count is
-an explicit `declare_elements` call next to the datatype it multiplies. A
-wrong count reads the wrong number of bytes out of ECU memory.
+**Element counts and tabulations are supplied, not guessed.** `a2l_parse`
+does not retain the ASAP2 `NUMBER` / `NO_AXIS_PTS` keywords, and it skips the
+`COMPU_TAB` blocks, so neither a curve's element count nor a `TABLE`
+conversion's points arrive with the parse. Both are explicit
+(`declare_elements`, `register_table`) rather than inferred — a wrong element
+count reads the wrong number of bytes out of ECU memory, and a wrong tabulation
+converts raw values the engineer never saw. `sample::complete` applies the
+demo project's own values to any project you parsed yourself.
 
 **A degenerate limit range imposes no constraint.** Generators emit
 `0.0 0.0` for ASCII identifiers; reading that as "the value must be exactly
@@ -118,7 +122,7 @@ cargo run --example calibrate -- data/powertrain.a2l data/powertrain.dbc
 
 ## Tests
 
-`cargo test` runs 157 tests across seven suites plus two doctests:
+`cargo test` runs 167 tests across seven suites plus two doctests:
 
 | Suite | Covers |
 |---|---|
@@ -127,6 +131,7 @@ cargo run --example calibrate -- data/powertrain.a2l data/powertrain.dbc
 | `session` | read-modify-write against the mock, read-back verification, page isolation, snapshot/restore bit-exactness, diff reports, hand-computed byte-order extraction, transport error propagation |
 | `calibrate` | monotone fits recovering synthetic data, non-monotone rejection, bounded 2-D optimisation, convergence reporting |
 | `errors` | `Display` for every `CalError` variant, each variant reached from the public API, the `Error` / `source()` contract |
+| `model` | every ASAP2 datatype and characteristic kind, signed bit-pattern handling, datatype-derived bounds, and the resolved model's accessors |
 | `properties` | 500-case linear round-trip, 200-case snapshot/restore idempotence, 300-case byte-order extraction against an independently written naive bit-walk, plus curve and error-rendering properties |
 
 `cargo fuzz run cal_parse` covers the calibration layer over arbitrary input

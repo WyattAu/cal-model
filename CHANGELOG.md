@@ -54,7 +54,7 @@ Initial release — L2 application layer over `a2l-parse` (L1), `xcp-core`
   calibration.
 - **Errors**: `CalError`, typed and exhaustive, 13 variants, `source()`
   through to the wrapped substrate errors.
-- **Gates**: 157 tests across seven suites, a 5-property proptest battery
+- **Gates**: 167 tests across seven suites, a 5-property proptest battery
   (500 / 200 / 300 / 100 / 100 cases), a cargo-fuzz target `cal_parse` with
   a committed corpus, tier-a shared CI pinned to engineering-standards
   `main`, and 90 %+ line coverage.

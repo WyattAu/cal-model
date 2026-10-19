@@ -44,6 +44,12 @@ fn run() -> Result<(), cal_model::CalError> {
     let project = match arguments.next() {
         Some(path) => {
             let mut project = CalibrationProject::from_a2l_file(Path::new(&path))?;
+            // `a2l_parse` skips the COMPU_TAB blocks and does not retain the
+            // element counts, so a project loaded from a file needs both
+            // supplied before its TABLE conversions resolve. A host with its
+            // own source for either would call `register_table` /
+            // `declare_elements` directly.
+            cal_model::complete(&mut project)?;
             if let Some(dbc) = arguments.next() {
                 project.attach_dbc_text(&std::fs::read_to_string(&dbc).map_err(|error| {
                     cal_model::CalError::Io {

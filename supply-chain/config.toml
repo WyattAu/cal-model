@@ -192,3 +192,6 @@ criteria = "safe-to-run"
 [[exemptions.zerocopy-derive]]
 version = "0.8.60"
 criteria = "safe-to-deploy"
+
+[policy]
+audit-as-crates-io = true

@@ -1,6 +1,6 @@
 [package]
 name = "cal-model"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Wyatt Au <wyatt_au@protonmail.com>"]
@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/WyattAu/cal-model"
 homepage = "https://github.com/WyattAu/cal-model"
 documentation = "https://docs.rs/cal-model"
-description = "A2L calibration data model and session layer — characteristic binding, COMPU_METHOD conversions, limit validation, curve calibration"
+description = "A2L calibration data model and session layer: characteristic binding, COMPU_METHOD conversions, limit validation, curve calibration"
 readme = "README.md"
 keywords = ["a2l", "calibration", "automotive", "xcp", "ecu"]
 categories = ["science", "data-structures", "encoding", "parser-implementations"]

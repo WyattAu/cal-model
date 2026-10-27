@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "a2l-parse"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "991feecefefb21057f1a3bcf050057dd1aa527f27191fff11e56c79785b581dd"
+checksum = "975e068b51fca98973262d03623a8cd8120551a66d29473588cc2731c3d01587"
 
 [[package]]
 name = "autocfg"

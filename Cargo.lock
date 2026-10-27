@@ -488,9 +488,9 @@ dependencies = [
 
 [[package]]
 name = "xcp-core"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "479676001f9f4d915d06d8668539f44e08313df11d720b95b9df9f87c912fb0a"
+checksum = "1f72932b1f8b739e27b22b8dd74d228984d17bbfbdd3cf1e273ef969d223c224"
 dependencies = [
  "can-core",
  "thiserror",

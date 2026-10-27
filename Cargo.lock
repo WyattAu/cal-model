@@ -129,9 +129,9 @@ dependencies = [
 
 [[package]]
 name = "dbc-parse"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bad00585984b06d9c6b37cdb324fd49f15b7c534cb6e5adbb1a23f247924a4c1"
+checksum = "df775d837e0fb4cd3b34e664506eb11df9d1f3dfcf7320c4143b771f9a14c09a"
 
 [[package]]
 name = "equivalent"

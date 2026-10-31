@@ -1,4 +1,4 @@
-# Security Policy — cal-model
+# Security Policy: cal-model
 
 ## Supported versions
 

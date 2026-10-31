@@ -4,15 +4,15 @@ All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning:
 [SemVer](https://semver.org/).
 
-## [0.1.0] — 2026-10-06
+## [0.1.0]: 2026-10-06
 
-Initial release — L2 application layer over `a2l-parse` (L1), `xcp-core`
+Initial release; L2 application layer over `a2l-parse` (L1), `xcp-core`
 (L1), and `dbc-parse` (L0).
 
 ### Added
 
 - **Project**: `CalibrationProject::from_a2l` / `from_a2l_file` /
-  `from_parsed`, with strict reference resolution — an undeclared
+  `from_parsed`, with strict reference resolution; an undeclared
   `COMPU_METHOD` or `RECORD_LAYOUT` is `CalError::Unsupported`, never a
   guessed default. `to_physical` / `to_raw` / `check_limits`,
   `attach_dbc` / `attach_dbc_text` with layout validation,
@@ -20,7 +20,7 @@ Initial release — L2 application layer over `a2l-parse` (L1), `xcp-core`
   `require_` forms, `register_table`, `declare_elements`,
   `set_deposit_byte_order`, `locate`, and deposit coding (`read_raw` /
   `write_raw` / `physical_values`).
-- **Conversions**: `CompuMethod` over all four A2L conversion types —
+- **Conversions**: `CompuMethod` over all four A2L conversion types -
   LINEAR and IDENTITY closed-form, RAT_FUNC evaluated as written and
   inverted by bisection (ascending or descending), TABLE with `TAB_INTP`
   interpolation and `TAB_NOINTP` step lookup, each invertible and
@@ -45,7 +45,7 @@ Initial release — L2 application layer over `a2l-parse` (L1), `xcp-core`
   `optimal_point` / `optimize_working_point` (bounded deterministic
   coordinate descent with multi-start, `Convergence` carrying the sweep
   count).
-- **Mock**: `mock::MockTransport` — sparse per-page ECU memory, recorded
+- **Mock**: `mock::MockTransport`; sparse per-page ECU memory, recorded
   traffic, injectable read/write failures, and `from_transport` for
   recovering it from a `&dyn XcpTransport`.
 - **Fixtures**: an embedded two-ECU demo project (15 characteristics

@@ -1,9 +1,9 @@
 # cal-model
 
-A2L calibration data model and session layer — characteristic binding,
+A2L calibration data model and session layer; characteristic binding,
 COMPU_METHOD conversions, limit validation, curve calibration.
 
-**Layer:** L2 — domain · **Estate deps:** `a2l-parse` L1, `xcp-core` L1,
+**Layer:** L2; domain · **Estate deps:** `a2l-parse` L1, `xcp-core` L1,
 `dbc-parse` L0 · **Runtime deps:** `thiserror` only.
 
 ## What this layer is
@@ -38,14 +38,14 @@ to do the joining. That is this crate:
 
 | Module | Contents |
 |---|---|
-| `project` | [`CalibrationProject`] — `from_a2l` / `from_a2l_file`, reference resolution (an undeclared `COMPU_METHOD` or `RECORD_LAYOUT` is a typed error, never a guessed default), `to_physical` / `to_raw` / `check_limits`, `attach_dbc`, `register_table`, `declare_elements`, deposit coding (`read_raw` / `write_raw`) |
-| `conversion` | [`CompuMethod`] — LINEAR, RAT_FUNC (evaluated as written, inverted by bisection), TABLE (`TAB_INTP` interpolation and `TAB_NOINTP` step lookup) and IDENTITY, with `apply` total and `invert` bracket-checked |
-| `model` | [`Characteristic`], [`Measurement`], [`Module`], [`CharKind`] — the resolved, addressable view of an A2L declaration, including signed-bit-pattern handling and datatype-derived bounds |
-| `session` | [`XcpTransport`] (two methods, plus an optional `set_page`), [`CalibrationSession`] — read, read-whole-curve, verified write, `SET_CAL_PAGE`, [`Snapshot`] / restore / [`diff_snapshots`] / [`render_deltas`] |
-| `signal` | [`SignalBinding`] — a characteristic or measurement bound to a DBC signal, with both byte orders' bit coding |
-| `calibrate` | [`calibrate_curve`] — a monotone piecewise-linear fit through measured nodes; [`optimal_point`] / [`optimize_working_point`] — bounded, deterministic coordinate descent |
-| `mock` | [`mock::MockTransport`] — an in-memory ECU (pages, recorded traffic, injectable failures), so a session can be exercised with no hardware |
-| `error` | [`CalError`] — typed and exhaustive, 13 variants, `source()` through to the wrapped substrate errors |
+| `project` | [`CalibrationProject`]; `from_a2l` / `from_a2l_file`, reference resolution (an undeclared `COMPU_METHOD` or `RECORD_LAYOUT` is a typed error, never a guessed default), `to_physical` / `to_raw` / `check_limits`, `attach_dbc`, `register_table`, `declare_elements`, deposit coding (`read_raw` / `write_raw`) |
+| `conversion` | [`CompuMethod`]; LINEAR, RAT_FUNC (evaluated as written, inverted by bisection), TABLE (`TAB_INTP` interpolation and `TAB_NOINTP` step lookup) and IDENTITY, with `apply` total and `invert` bracket-checked |
+| `model` | [`Characteristic`], [`Measurement`], [`Module`], [`CharKind`]; the resolved, addressable view of an A2L declaration, including signed-bit-pattern handling and datatype-derived bounds |
+| `session` | [`XcpTransport`] (two methods, plus an optional `set_page`), [`CalibrationSession`]; read, read-whole-curve, verified write, `SET_CAL_PAGE`, [`Snapshot`] / restore / [`diff_snapshots`] / [`render_deltas`] |
+| `signal` | [`SignalBinding`]; a characteristic or measurement bound to a DBC signal, with both byte orders' bit coding |
+| `calibrate` | [`calibrate_curve`]; a monotone piecewise-linear fit through measured nodes; [`optimal_point`] / [`optimize_working_point`]; bounded, deterministic coordinate descent |
+| `mock` | [`mock::MockTransport`]; an in-memory ECU (pages, recorded traffic, injectable failures), so a session can be exercised with no hardware |
+| `error` | [`CalError`]; typed and exhaustive, 13 variants, `source()` through to the wrapped substrate errors |
 | `sample` | the embedded two-ECU demo project: 15 characteristics (every kind, every conversion type), 5 measurements, a DBC, seed memory, and a factory calibration |
 
 ## Design decisions worth knowing
@@ -70,14 +70,14 @@ reports a write it cannot confirm is worse than one that reports an error.
 does not retain the ASAP2 `NUMBER` / `NO_AXIS_PTS` keywords, and it skips the
 `COMPU_TAB` blocks, so neither a curve's element count nor a `TABLE`
 conversion's points arrive with the parse. Both are explicit
-(`declare_elements`, `register_table`) rather than inferred — a wrong element
+(`declare_elements`, `register_table`) rather than inferred; a wrong element
 count reads the wrong number of bytes out of ECU memory, and a wrong tabulation
 converts raw values the engineer never saw. `sample::complete` applies the
 demo project's own values to any project you parsed yourself.
 
 **A degenerate limit range imposes no constraint.** Generators emit
 `0.0 0.0` for ASCII identifiers; reading that as "the value must be exactly
-zero" would be wrong, so `lower >= upper` means "unconstrained" — the same
+zero" would be wrong, so `lower >= upper` means "unconstrained"; the same
 convention `dbc-parse` applies to an empty `[min|max]`.
 
 **IEEE-754 deposits are refused.** Every raw/physical contract in this crate
@@ -111,7 +111,7 @@ session.write_characteristic("engine", "idle_target_rpm", 950.0)?;
 # }
 ```
 
-The `calibrate` example runs the whole cycle end to end — inventory with
+The `calibrate` example runs the whole cycle end to end; inventory with
 limits, read-modify-write, a refused out-of-limit write, page switching,
 the diff report, and a curve fit:
 
@@ -148,7 +148,7 @@ with the declared layer exactly.
 
 ## License
 
-MIT OR Apache-2.0 — see LICENSE-MIT and LICENSE-APACHE.
+MIT OR Apache-2.0; see LICENSE-MIT and LICENSE-APACHE.
 
 [`a2l-parse`]: https://docs.rs/a2l-parse
 [`dbc-parse`]: https://docs.rs/dbc-parse
